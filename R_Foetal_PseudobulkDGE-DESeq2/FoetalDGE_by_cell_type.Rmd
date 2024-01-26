@@ -1,0 +1,2282 @@
+---
+title: "Foetal_PseudobulkDGE"
+author: "Alina Kurjan"
+date: "2023-08-12"
+output: html_document
+---
+```{r}
+rm(list = ls())
+```
+
+```{r setup, include=FALSE}
+library(rmarkdown)
+library(tinytex)
+library(knitr)
+library(tidyverse)
+library(pheatmap)
+library(gprofiler2)
+library(RColorBrewer)
+library(glmpca)
+library(cowplot)
+library(DT)
+library(heatmaply)
+library(msigdbr)
+library(paletteer)
+library(gridExtra)
+library(patchwork)
+
+library(GO.db)
+library(org.Hs.eg.db)
+
+# Bioconductor:
+#library(tximport)
+#library(EnsDb.Hsapiens.v86)
+#library(rhdf5)
+library(DESeq2)
+#install.packages('lasso2_1.2-22.tar.gz', lib='/Users/akurjan/Devel/gitAnalysis/bulk_analysis/renv/library/R-4.2/x86_64-apple-darwin17.0',repos = NULL)
+library(DEGreport)
+
+#BiocManager::install("DESeq2")
+library(ensembldb)
+library(EnhancedVolcano)
+library(pathview)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+library(fgsea)
+#BiocManager::install(c("enrichplot", "pathview", "EnhancedVolcano", "ensembldb"))
+
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, error = TRUE, dev = c("pdf", "tiff", "png"), dpi = 300, cache = TRUE)
+```
+
+```{r GENERAL PARAMETERS}
+wdir = '/mnt/da8aa2c4-0136-465b-87a2-d12a59afec55/akurjan/analysis/rnotebooks/Foetal_PseudobulkDGE/'
+setwd(wdir)
+
+# List of cell type names
+cell_types <- c("ABI3BP_GAS2_Fibroblasts_1", 
+                "ABI3BP_GAS2_Fibroblasts_2", 
+                "NEGR1_SCN7A_Fibroblasts",
+                "COL3A1_PI16_Fibroblasts",
+                "COL6A6_FNDC1_Fibroblasts",
+                "FGF14_THBS4_Fibroblasts",
+                "Satellite_Cells",
+                "Skeletal_Myocytes",
+                "Smooth_Myocytes",
+                "vasEndothelial_Cells",
+                #"lymEndothelial_Cells",
+                "Nervous_System_Cells",
+                "Immune_Cells"
+)
+                
+
+input_folder <- "Input/"
+
+NDORMS_pallette <- c("#EE7422", "#91479A", "#3AAAE2")
+heat_colors <- brewer.pal(9, "YlOrRd")
+bocchi_colors <- c("#F2C9D5", "#B43E44", "#FADF92" , "#496496", "#282828", "#904869")
+```
+
+```{r FOLDER CREATION}
+# Function to create subfolders for a given cell type
+createSubfolders <- function(wdir, cell_type) {
+  cell_type_folder <- file.path(wdir, cell_type)
+  results_folder <- file.path(cell_type_folder, "Results")
+  figures_folder <- file.path(cell_type_folder, "Figures")
+  
+  # Create directories if they don't exist
+  if (!file.exists(cell_type_folder)) {
+    dir.create(cell_type_folder)
+  }
+  if (!file.exists(results_folder)) {
+    dir.create(results_folder)
+  }
+  if (!file.exists(figures_folder)) {
+    dir.create(figures_folder)
+  }
+}
+
+# Create subfolders for each cell type
+for (cell_type in cell_types) {
+  createSubfolders(wdir, cell_type)
+}
+```
+
+
+```{r MAKING DESEQ OBJECTS}
+# Create a list to store dds objects for each cell type
+dds_list <- list()
+dds_lrt_list <- list()
+
+# Create DESeqDataSet for a given cell type
+for (cell_type in cell_types) {
+  metadata_file <- paste0(input_folder, "metadata_", cell_type, ".csv")
+  counts_file <- paste0(input_folder, "counts_matrix_", cell_type, ".csv")
+  
+  metadata <- read.csv(metadata_file, row.names = 1)
+  metadata$libbatch <- as.factor(metadata$libbatch)
+  metadata$replicate <- as.factor(metadata$replicate)
+  
+  metadatalrt <- metadata
+  metadatalrt$age <- factor(metadata$age, levels = c("12w", "17w", "20w"))
+  metadata$age <- factor(metadata$age, levels = c("17w", "12w", "20w"))
+  
+  counts <- read.csv(counts_file, row.names = 1)
+  
+  print(cell_type)
+  dds <- DESeqDataSetFromMatrix(countData = counts,
+                                colData = metadata,
+                                design = ~ age)
+  
+  dds_lrt <- DESeqDataSetFromMatrix(countData = counts,
+                                colData = metadatalrt,
+                                design = ~ age)
+  
+  # Filtering: keep samples that have a count of higher than 30
+  dds <- dds[rowSums(counts(dds)) > 30, ]
+  dds_lrt <- dds_lrt[rowSums(counts(dds_lrt)) > 30, ]
+  
+  dds_list[[cell_type]] <- dds
+  dds_lrt_list[[cell_type]] <- dds_lrt
+}
+
+rm(dds, dds_lrt, counts)
+# Now you have a list of dds objects for each cell type
+# You can access them using dds_list$FGF14_THBS4_Fibroblasts, dds_list$Other_Cell_Type_1, etc.
+```
+
+------------------------------------------------------------------------
+
+# Exploratory analysis and visualization
+```{r NORMALISED COUNTS}
+normalised_counts_list <- list()
+
+for (cell_type in cell_types) {
+  dds <- dds_list[[cell_type]]
+  dds <- estimateSizeFactors(dds) # Estimate size factors
+  normalised_counts <- counts(dds, normalized=TRUE)
+  normalised_counts <- normalised_counts %>% 
+    data.frame(check.names = FALSE) 
+  normalised_counts_list[[cell_type]] <- normalised_counts
+  write.table(normalised_counts, file=file.path(wdir, cell_type,"normalised_counts.txt"), sep="\t", quote=F, col.names=NA)
+  
+  rm(normalised_counts)
+}
+```
+
+```{r QC PLOTS}
+# Create subfolders and run the code for each cell type
+for (cell_type in cell_types) {
+  # Load the dds object for the current cell type
+  dds <- dds_list[[cell_type]]
+  
+  rld <- rlog(dds, blind = TRUE) # Regularised-logarithm transformation (Rlog)
+  anno <- as.data.frame(colData(rld)[, c("age", "libbatch", "type")])
+
+  rld_mat <- assay(rld)
+  rld_cor <- cor(rld_mat) # Compute pairwise correlation values
+  pca <- prcomp(t(rld_mat)) # PCA
+  num_pcs <- sum(pca$sdev > 0)
+  
+  # Create the file path for saving the heatmap plot
+  heatmap_file1 <- file.path(wdir, cell_type, "Figures", "QC_sample_distancesimilarity_pheatmap.svg")
+  heatmap_file2 <- file.path(wdir, cell_type, "Figures", "QC_sample_distancesimilarity_pheatmap_color.svg")
+  pca_scree <- file.path(wdir, cell_type, "Figures", "QC_sample_pca_scree.svg")
+  pca_age <- file.path(wdir, cell_type, "Figures", "QC_sample_pca_age.svg")
+  pca_libbatch <- file.path(wdir, cell_type, "Figures", "QC_sample_pca_libbatch.svg")
+  pca_type <- file.path(wdir, cell_type, "Figures", "QC_sample_pca_type.svg")
+  
+  # PLOT1
+  sampleDists <- dist(t(rld_mat))
+  sampleDistMatrix <- as.matrix(sampleDists)
+  rownames(sampleDistMatrix) <- paste(rld$sampletype, rld$age, sep = "_")
+  colnames(sampleDistMatrix) <- NULL
+  colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+  svg(heatmap_file1, width = 10, height = 7)
+  pheatmap(sampleDistMatrix,
+           clustering_distance_rows = sampleDists,
+           clustering_distance_cols = sampleDists,
+           col = colors)
+  dev.off()
+  
+  # PLOT2
+  svg(heatmap_file2, width = 16, height = 12)
+  pheatmap(rld_cor, annotation = anno)
+  dev.off()
+  
+ # PLOT3: Scree plot with proportions of variance explained per PC
+  var_explained_df <- data.frame(PC = paste0("PC", 1:num_pcs), var_explained = (pca$sdev[1:num_pcs])^2 / sum((pca$sdev[1:num_pcs])^2) * 100)
+  var_explained_df$PC <- factor(var_explained_df$PC, levels = var_explained_df$PC)
+  svg(pca_scree, width = 9, height = 7)
+  pca_scree_plot <- ggplot(var_explained_df, aes(x = PC, y = var_explained)) +
+    geom_col() +
+    labs(title = "Scree plot: PCA on Rlog-transformed Data") +
+    ylab("% of Variance Explained")
+  print(pca_scree_plot)
+  dev.off()
+  
+  # PLOTS 4, 5, 6
+  svg(pca_age, width = 7, height = 7)
+  pca_age_plot <- plotPCA(rld, intgroup = c("age"), ntop = 700)
+  print(pca_age_plot)
+  dev.off()
+  
+  svg(pca_libbatch, width = 7, height = 7)
+  pca_libbatch_plot <- plotPCA(rld, intgroup = c("libbatch"), ntop = 700)
+  print(pca_libbatch_plot)
+  dev.off()
+  
+  svg(pca_type, width = 7, height = 7)
+  pca_type_plot <- plotPCA(rld, intgroup = c("type"), ntop = 700)
+  print(pca_type_plot)
+  dev.off()
+  
+  rm(rld, rld_mat, rld_cor, pca, anno, sampleDistMatrix, sampleDists, colors, dds,
+     rld_cor, var_explained_df, pca_age_plot, pca_type_plot, pca_libbatch_plot, pca_scree_plot)
+}
+```
+------------------------------------------------------------------------
+
+# Differential Expression Analysis
+```{r WALD AND LRT TESTS RUNNING}
+# Create a new list to store dds_lrt objects
+res_lrt_list <- list()
+res_young_list <- list()
+res_old_list <- list()
+contrast_old <- c("age", "20w", "17w")
+contrast_young <- c("age", "17w", "12w")
+
+# Run the DESeq differential expression pipeline for each cell type
+for (cell_type in cell_types) {
+  # Load the dds object for the current cell type
+  dds <- dds_list[[cell_type]]
+  dds <- DESeq(dds) # Run Wald test
+  
+  dds_lrt <- dds_lrt_list[[cell_type]]
+  dds_lrt <- DESeq(dds_lrt, test = "LRT", reduced = ~1) # Run LRT test
+  
+  # Update the original dds_list with DESeq results
+  dds_list[[cell_type]] <- dds
+  dds_lrt_list[[cell_type]] <- dds_lrt
+  
+  # Plot size factors
+  plot_table <- data.frame(sample = row.names(colData(dds)), 
+                           size_factors = sizeFactors(dds), 
+                           age = colData(dds)$age)
+  
+  size_factors_plot <- ggplot(plot_table, aes(x = sample, y = size_factors, fill = age)) +
+    geom_col() +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1))
+  ggsave(file.path(wdir, cell_type, "Figures", "size_factors_plot.svg"), size_factors_plot, width = 10, height = 7)
+
+  
+  # Plot dispersion estimates
+  svg(file.path(wdir, cell_type, "Figures", "dispersion_plot.svg"), width = 10, height = 7)
+  plotDispEsts(dds)
+  dev.off()
+  
+  # Get results for contrasts
+  res_old <- results(dds, contrast = contrast_old, alpha = 0.05)
+  res_young <- results(dds, contrast = contrast_young, alpha = 0.05)
+  res_lrt <- results(dds_lrt, alpha = 0.01)
+  
+  res_lrt_list[[cell_type]] <- res_lrt
+  res_young_list[[cell_type]] <- res_young
+  res_old_list[[cell_type]] <- res_old
+  
+  # Save summary metrics to a file
+  summary_file <- file.path(wdir, cell_type, "Results", "summary_metrics.txt")
+  cat("LRT Test:\n", capture.output(summary(res_lrt)), "\n", file = summary_file)
+  cat("Old vs. Young Contrast (Old):\n", capture.output(summary(res_old)), "\n", file = summary_file, append = TRUE)
+  cat("Old vs. Young Contrast (Young):\n", capture.output(summary(res_young)), "\n", file = summary_file, append = TRUE)
+  
+  rm(res_young, res_old, res_lrt, summary_file, plot_table, size_factors_plot)
+}
+```
+
+## Shrinking Log2FoldChange Values (apeglm, ashr) & Creating MA-plots
+To generate more accurate log2 foldchange estimates, DESeq2 allows for the shrinkage of the LFC estimates toward zero when the information for a gene is low, which could include:
+-   Low counts
+-   High dispersion values
+```{r WALD TEST VALUE SHRINKAGE}
+res_apeglm_old_list <- list()
+res_apeglm_young_list <- list()
+res_ashr_old_list <- list()
+res_ashr_young_list <- list()
+
+for (cell_type in cell_types) {
+  # Load the dds object for the current cell type
+  dds <- dds_list[[cell_type]]
+  res_young <- res_young_list[[cell_type]]
+  res_old <- res_old_list[[cell_type]]
+  
+  res_apeglm_old <- lfcShrink(dds, coef = "age_20w_vs_17w", type="apeglm")
+  res_apeglm_young <- lfcShrink(dds, coef = "age_12w_vs_17w", type="apeglm")
+  res_ashr_young <- lfcShrink(dds, contrast = c("age", "12w", "17w"), type = "ashr", res = res_young)
+  res_ashr_old <- lfcShrink(dds, contrast = c("age", "20w", "17w"), type = "ashr", res = res_old)
+  
+  res_apeglm_old_list[[cell_type]] <- res_apeglm_old
+  res_apeglm_young_list[[cell_type]] <- res_apeglm_young
+  res_ashr_old_list[[cell_type]] <- res_ashr_young
+  res_ashr_young_list[[cell_type]] <- res_ashr_old
+  
+  # MA PLOTS:
+  # Get top gene for old vs. young contrast
+  topGeneold <- rownames(res_old)[which.min(res_old$padj)]
+  topGeneyoung <- rownames(res_young)[which.min(res_young$padj)]
+  
+  # Save rawMAplot_1920vs1517.svg
+  svg(file.path(wdir, cell_type, "Figures", "rawMAplot_20wvs17w.tiff"), width = 7, height = 5)
+  plotMA(res_old, ylim = c(-5, 5))
+  with(res_old[topGeneold, ], {
+    points(baseMean, log2FoldChange, col = "black", cex = 2, lwd = 2)
+    text(baseMean, log2FoldChange, topGeneold, pos = 1, col = "black")
+  })
+  dev.off()
+  
+  # Save rawMAplot_1517vs1113.svg
+  svg(file.path(wdir, cell_type, "Figures", "rawMAplot_12wvs17w.tiff"), width = 7, height = 5)
+  plotMA(res_young, ylim = c(-5, 5))
+  with(res_young[topGeneyoung, ], {
+    points(baseMean, log2FoldChange, col = "black", cex = 2, lwd = 2)
+    text(baseMean, log2FoldChange, topGeneyoung, pos = 1, col = "black")
+  })
+  dev.off()
+  
+  # Save APEGLM_MAplot_1517.svg
+  svg(file.path(wdir, cell_type, "Figures", "APEGLM_MAplot_12wvs17w.tiff"), width = 7, height = 5)
+  plotMA(res_apeglm_young, ylim = c(-5, 5))
+  dev.off()
+  
+  # Save APEGLM_MAplot_1920.svg
+  svg(file.path(wdir, cell_type, "Figures", "APEGLM_MAplot_20wvs17w.tiff"), width = 7, height = 5)
+  plotMA(res_apeglm_old, ylim = c(-5, 5))
+  dev.off()
+  
+  # Save ASHR_MAplot_1517.svg
+  svg(file.path(wdir, cell_type, "Figures", "ASHR_MAplot_12wvs17w.tiff"), width = 7, height = 5)
+  plotMA(res_ashr_young, ylim = c(-5, 5))
+  dev.off()
+  
+  # Save ASHR_MAplot_1920.svg
+  svg(file.path(wdir, cell_type, "Figures", "ASHR_MAplot_20wvs17w.tiff"), width = 7, height = 5)
+  plotMA(res_ashr_old, ylim = c(-5, 5))
+  dev.off()
+
+  rm (res_ashr_old, res_ashr_young, res_apeglm_young, res_apeglm_old, topGeneold, topGeneyoung)
+}
+```
+*using 'apeglm' for LFC shrinkage. If used in published research, please cite:
+    Zhu, A., Ibrahim, J.G., Love, M.I. (2018) Heavy-tailed prior distributions for
+    sequence count data: removing the noise and preserving large differences.
+    Bioinformatics. https://doi.org/10.1093/bioinformatics/bty895
+*using 'ashr' for LFC shrinkage. If used in published research, please cite:
+    Stephens, M. (2016) False discovery rates: a new deal. Biostatistics, 18:2.
+    https://doi.org/10.1093/biostatistics/kxw041
+
+An MA-plot of changes induced by development. The log2 fold change for a particular comparison is plotted on the y-axis and the average of the counts normalized by size factor is shown on the x-axis. Each gene is represented with a dot. Genes with an adjusted p value below a threshold (here 0.1, the default) are shown in blue. The more to the right something is, the more highly expressed it is.
+
+We should ideally see significant genes (blue) across the full range of expression levels
+
+will use ashr-shrinked values as they appear better.
+
+## DEGs Tables after shrinkage with ASHR method
+```{r UPREGULATED/DOWNREGULATED DEGS}
+upregulated_young_ASHR_list <- list()
+downregulated_young_ASHR_list <- list()
+upregulated_old_ASHR_list <- list()
+downregulated_old_ASHR_list <- list()
+
+prepare_res_df <- function(res_data) {
+  res_data_df <- res_data %>%
+    as.data.frame() %>%
+    dplyr::filter(!is.na(padj)) 
+  ensid <- mapIds(org.Hs.eg.db, 
+                 keys = rownames(res_data_df), 
+                 column="ENSEMBL",
+                 keytype="SYMBOL",
+                 multiVals="first")
+  res_data_df$ensembl_id <- ensid
+  return(res_data_df)
+} 
+
+define_and_save_regulated <- function(res_data_df){
+  upregulated <- res_data_df %>%
+    dplyr::filter(padj < 0.01 & log2FoldChange >= 1)
+  downregulated <- res_data_df %>%
+    dplyr::filter(padj < 0.01 & log2FoldChange <= -1)
+  
+  upregulated_file <- file.path(wdir, cell_type, "Results", 
+                                paste(strsplit(deparse(substitute(res_data_df)), '_')[[1]][3], "ASHR_upregulated_genes.csv"))
+  downregulated_file <- file.path(wdir, cell_type, "Results", 
+                                  paste(strsplit(deparse(substitute(res_data_df)), '_')[[1]][3], "ASHR_downregulated_genes.csv"))
+  all_genes_file <- file.path(wdir, cell_type, "Results", 
+                              paste(strsplit(deparse(substitute(res_data_df)), '_')[[1]][3], "ASHR_all_genes.csv"))
+  
+  write.csv(upregulated, file = upregulated_file)
+  write.csv(downregulated, file = downregulated_file)
+  write.csv(res_data_df, file = all_genes_file)
+  
+  return(list(upregulated = upregulated, downregulated = downregulated))
+}
+
+create_full_volcano <- function(res_data_df, title, savename){
+  volcano <- EnhancedVolcano(res_data_df,
+    lab = rownames(res_data_df),
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = title,
+    pCutoff = 10e-6,
+    FCcutoff = 1,
+    pointSize = 2.0,
+    labSize = 5.0,
+    labCol = 'black',
+    labFace = 'bold',
+    boxedLabels = TRUE,
+    colAlpha = 4/5,
+    legendPosition = 'right',
+    legendLabels=c('Not sig.','Log₂FC','p-value',
+      'p-value & Log₂FC'),
+    legendLabSize = 14,
+    legendIconSize = 4.0,
+    drawConnectors = TRUE,
+    arrowheads = FALSE,
+    widthConnectors = 0.5,
+    col=c('black', 'gray', 'lightblue', 'red3'))
+  ggsave(file.path(wdir, cell_type, "Figures", savename), volcano, 
+         width = 10, height = 8)
+}
+
+for (cell_type in cell_types) {
+  # create a dataframe
+  res_ashr_young <- res_ashr_young_list[[cell_type]]
+  res_ashr_old <- res_ashr_old_list[[cell_type]]
+  
+  res_ashr_young_df <- prepare_res_df(res_ashr_young) 
+  res_ashr_old_df <- prepare_res_df(res_ashr_old) 
+  
+  regulated_young <- define_and_save_regulated(res_ashr_young_df)
+  regulated_old <- define_and_save_regulated(res_ashr_old_df)
+  
+  upregulated_old_ASHR_list[[cell_type]] <- regulated_old$upregulated
+  downregulated_old_ASHR_list[[cell_type]] <- regulated_old$downregulated
+  upregulated_young_ASHR_list[[cell_type]] <- regulated_young$upregulated
+  downregulated_young_ASHR_list[[cell_type]] <- regulated_young$downregulated
+  
+  create_full_volcano(res_ashr_young_df, '12pcw vs 17pcw Foetal Tendons', "ASHR_Volcano_12wvs17w_legright.tiff")
+  create_full_volcano(res_ashr_old_df, '20pcw vs 17pcw Foetal Tendons', "ASHR_Volcano_20vs17w_legright.tiff")
+  
+  rm(ensid, upregulated, downregulated, res_ashr_young, res_ashr_old,
+     res_ashr_young_df, res_ashr_old_df,
+     volcano, regulated_young, regulated_old, title, savename)
+}
+```
+
+```{r HEATMAPS WITH ALL DEGS}
+# Function to create a heatmap for a given top_genes object
+create_heatmap_vst_all <- function(top_genes, vst_mat, cell_type, target_replicate, title_suffix) {
+  vst_mat_filtered <- vst_mat[, grepl(paste0("_", target_replicate, "$"), colnames(vst_mat))] %>%
+    data.frame(check.names = FALSE) %>%
+    mutate(gene = row.names(vst_mat)) %>%
+    filter(gene %in% top_genes$Gene)
+  
+  if (nrow(vst_mat_filtered) < 2) { # Check if there are at least 2 genes in the list
+    return(NULL)  # Skip plotting if fewer than 2 genes
+  }
+  
+  # Create row (sample) annotations
+  sample_names <- colnames(vst_mat_filtered[, -ncol(vst_mat_filtered)])
+  anno <- metadata %>%
+    rownames_to_column(var="samplename") %>% 
+    as_tibble() %>%
+    filter(samplename %in% sample_names) %>%
+    select(samplename, type, age) %>% 
+    data.frame(row.names = "samplename")
+  
+  # Create a matrix for heatmap
+  heatmap_data <- t(vst_mat_filtered[, -ncol(vst_mat_filtered)])
+    
+  # Create a clustered heatmap using pheatmap
+  name = paste(cell_type, "_allgenes_heatmap_vst", title_suffix, ".svg")
+  svg(file.path(wdir, cell_type, "Figures", name))
+  heatmap_obj <- pheatmap(heatmap_data,
+                          cellwidth = 15, cellheight = 12,
+                          color = colorRampPalette(rev(brewer.pal(8, "RdBu")))(7),
+                          main = paste(cell_type,"(", title_suffix, ")"),
+                          cluster_rows = FALSE,
+                          cluster_cols = TRUE,
+                          scale='row',
+                          fontsize = 10, 
+                          fontsize_row = 10,
+                          annotation_row=anno,
+                          height = 10,
+                          width=135)
+  dev.off()
+  return(heatmap_obj)
+}
+
+get_sig_genes_topN <- function(res_mat, top_n){
+  sig_genes <- res_mat %>% 
+    mutate(Gene = row.names(res_mat)) %>%
+    dplyr::filter(padj < 0.01 & abs(log2FoldChange) >= 0.58) %>%
+    dplyr::arrange(dplyr::desc(abs(log2FoldChange))) %>%
+    head(top_n)
+  return(sig_genes)
+}
+
+# Extract the replicate number from the sample names and choose the target replicate
+target_replicate <- 0  # Change this to select a different replicate
+
+for (cell_type in cell_types) {
+  dds <- dds_list[[cell_type]]
+  vst <- vst(dds, blind = TRUE)
+  vst_mat <- assay(vst)
+  
+  res_ashr_young <- res_ashr_young_list[[cell_type]]
+  res_ashr_old <- res_ashr_old_list[[cell_type]]
+  
+  res_ashr_old_df <- prepare_res_df(res_ashr_old)
+  res_ashr_young_df <- prepare_res_df(res_ashr_young)
+  
+  sig_genes_old <- get_sig_genes_topN(res_ashr_old_df, 50)
+  sig_genes_young <- get_sig_genes_topN(res_ashr_young_df, 50)
+  
+  heatmap_vst_young <- create_heatmap_vst_all(sig_genes_young, vst_mat, cell_type, target_replicate, "Up in 17w vs 12w")
+  heatmap_vst_old <- create_heatmap_vst_all(sig_genes_old, vst_mat, cell_type, target_replicate, "Up in 20w vs 17w")
+}
+
+```
+
+### Matrisome DEGs
+```{r}
+# load in the matrisome file from http://matrisomeproject.mit.edu
+matrisome <- read_csv("../Resources/matrisome_hs_masterlist.csv", show_col_types = FALSE)
+matrisome <- matrisome[1:683,]
+categories <- c("ECM-affiliated Proteins", "ECM Regulators", "ECM Glycoproteins", "Collagens", "Proteoglycans")
+matrisomal_genes <- list()
+
+for (category in categories) {
+  current_genes <- matrisome %>%
+    dplyr::filter(Category == category) %>%
+    pull(`Gene Symbol`)
+  matrisomal_genes[[category]] <- current_genes
+  rm(current_genes)
+}
+```
+
+```{r VOLCANO WITH MATRISOMAL GENES ONLY}
+category_colors <- c('ECM Glycoproteins' = '#904869', 'Collagens' = '#FADF92', 
+                       'Proteoglycans' = '#496496', 'ECM-affiliated Proteins' = '#B43E44' ,
+                       'ECM Regulators' = '#282828')
+
+prepare_res_mat <- function(res_data, matrisome) {
+  res_data_df <- prepare_res_df(res_data)
+  res_data_df_mat <- res_data_df %>%
+    mutate(Gene = row.names(res_data_df)) %>%
+    filter(Gene %in% matrisome$`Gene Symbol`) %>%
+    mutate(Category = matrisome$Category[match(Gene, matrisome$`Gene Symbol`)])
+  return(res_data_df_mat)
+} 
+
+create_custom_volcano <- function(res_data_df_mat, colors, title, savename){
+  colors <- category_colors[res_data_df_mat$Category]
+  #unique_categories <- unique(res_data_df_mat$Category)
+  #colors <- colors[unique_categories]
+  
+  volcano <- EnhancedVolcano(res_data_df_mat,
+    lab = rownames(res_data_df_mat),
+    colCustom = colors,
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = title,
+    pCutoff = 10e-6,
+    FCcutoff = 1,
+    pointSize = 3.0,
+    labSize = 5.0,
+    labCol = 'black',
+    labFace = 'bold',
+    boxedLabels = TRUE,
+    colAlpha = 4/5,
+    legendPosition = 'right',
+    legendLabSize = 14,
+    legendIconSize = 4.0,
+    drawConnectors = TRUE,
+    arrowheads = FALSE,
+    widthConnectors = 0.5) #+ coord_flip()
+  ggsave(file.path(wdir, cell_type, "Figures", savename), volcano, 
+         width = 10, height = 8)
+}
+
+for (cell_type in cell_types) {
+  # create a dataframe
+  res_ashr_old <- res_ashr_old_list[[cell_type]]
+  res_ashr_young <- res_ashr_young_list[[cell_type]]
+
+  res_ashr_old_df_mat <- prepare_res_mat(res_ashr_old, matrisome)
+  res_ashr_young_df_mat <- prepare_res_mat(res_ashr_young, matrisome)
+  
+  create_custom_volcano(res_ashr_old_df_mat, colors, 
+                        '20pcw vs 17pcw Foetal Tendons (ECM Genes)', 
+                        "ASHR_Volcano_ECMGenes_20vs17w.tiff")
+  create_custom_volcano(res_ashr_young_df_mat, colors, 
+                        '12pcw vs 17pcw Foetal Tendons (ECM Genes)', 
+                        "ASHR_Volcano_ECMGenes_12vs17w.tiff")
+}
+
+```
+
+```{r}
+# List of cell type names
+cell_types <- c("ABI3BP_GAS2_Fibroblasts_1", 
+                "ABI3BP_GAS2_Fibroblasts_2", 
+                "NEGR1_SCN7A_Fibroblasts",
+                "COL3A1_PI16_Fibroblasts",
+                "COL6A6_FNDC1_Fibroblasts",
+                "FGF14_THBS4_Fibroblasts",
+                "Satellite_Cells",
+                "Skeletal_Myocytes",
+                "Smooth_Myocytes",
+                "vasEndothelial_Cells",
+                #"lymEndothelial_Cells",
+                "Nervous_System_Cells",
+                "Immune_Cells"
+)
+```
+
+```{r}
+ego_functionalprof_wald <- function(sig_genes_df, res_df, title_suffix, wdir, cell_type){
+      allgenes <- as.character(res_df$ensembl_id)
+      siggenes <- sig_genes_df %>%
+        dplyr::filter(!is.na(ensembl_id))
+      siggenes <- as.character(siggenes$ensembl_id)
+      
+      ego <- enrichGO(gene = siggenes,
+                      universe = allgenes,
+                      keyType = "ENSEMBL",
+                      OrgDb = org.Hs.eg.db, 
+                      ont = "BP", 
+                      pAdjustMethod = "BH", 
+                      qvalueCutoff = 0.05, 
+                      readable = TRUE)
+      ## Output results from GO analysis to a table 
+      cluster_summary <- ego@result
+      write.csv(cluster_summary, file = file.path(wdir, cell_type, "Results", paste0("ASHR_WALD_clusterProfiler_BF", title_suffix, "_001pval.csv")))
+}
+
+gprofiler2_save_gem <- function(sig_genes_df, title_suffix, wdir, cell_type){
+      gostres <- gost(sig_genes_df$gene, organism = "hsapiens", user_threshold = 0.05, 
+                       correction_method = "fdr", significant = TRUE, 
+                       exclude_iea = TRUE, ordered_query = TRUE)
+      gem <- gostres$result[,c("term_id", "term_name", "p_value", "intersection_size")]
+      colnames(gem) <- c("GO.ID", "Description", "p.Val", "Genes")
+      gem$FDR <- gem$p.Val
+      gem$Phenotype = "+1"
+      gem <- gem[,c("GO.ID", "Description", "p.Val", "FDR", "Phenotype", "Genes")]
+      write.table(gem, file = file.path(wdir, cell_type, "Results", paste0("ASHR_WALD_gProfiler2_GEM_", title_suffix, ".txt")), 
+                  sep = "\t", quote = F, row.names = F)
+}
+
+significant_only_vst_df <- function(sig_genes, vst_mat){
+  # Check if there are any significant genes
+  if (nrow(sig_genes) > 0) {
+    # Check if the gene names exist in vst_mat
+    valid_genes <- sig_genes$gene[sig_genes$gene %in% rownames(vst_mat)]
+    
+    if (length(valid_genes) > 0) {
+      cluster_vst <- vst_mat[valid_genes, ]
+      # Continue with further processing using cluster_vst
+    } else {
+      cat("No valid genes found in vst_mat.\n")
+    }
+  } else {
+    cat("No significant genes found.\n")
+  }
+}
+
+sig_genes_ashr_old_list <- list()
+sig_genes_ashr_young_list <- list()
+
+for (cell_type in cell_types) {
+  #dds <- dds_list[[cell_type]]
+  #vst <- vst(dds, blind = TRUE)
+  #vst_mat <- assay(vst)
+  
+  res_ashr_old <- res_ashr_old_list[[cell_type]]
+  res_ashr_young <- res_ashr_young_list[[cell_type]]
+  
+  res_old_df <- prepare_res_df(res_ashr_old) %>% 
+    rownames_to_column(var="gene") 
+  
+  res_young_df <- prepare_res_df(res_ashr_young) %>% 
+    rownames_to_column(var="gene") 
+
+  sig_genes_old <- res_old_df %>% 
+    dplyr::filter(padj < 0.01) %>%
+    arrange(dplyr::desc(abs(log2FoldChange)))
+  sig_genes_young <- res_young_df %>% 
+    dplyr::filter(padj < 0.01) %>%
+    arrange(dplyr::desc(abs(log2FoldChange)))
+  
+  sig_genes_ashr_old_list[[cell_type]] <- sig_genes_old
+  sig_genes_ashr_young_list[[cell_type]] <- sig_genes_young
+  
+  #write.csv(sig_genes_old, file = file.path(wdir, cell_type, "Results", "WALD_SignificantGenes_20vs17w_001pval.csv"))
+  #write.csv(sig_genes_young, file = file.path(wdir, cell_type, "Results", "WALD_SignificantGenes_12vs17w_001pval.csv"))
+  
+  #sig_genes_ashr_old_vst <- significant_only_vst_df(sig_genes_old, vst_mat)
+  #sig_genes_ashr_young_vst <- significant_only_vst_df(sig_genes_young, vst_mat)
+  
+  #ego_functionalprof_wald(sig_genes_old, res_old_df, "20vs17w", wdir, cell_type)
+  #ego_functionalprof_wald(sig_genes_young, res_young_df, "12vs17w", wdir, cell_type)
+  
+  gprofiler2_save_gem(sig_genes_old, "20vs17w", wdir, cell_type)
+  gprofiler2_save_gem(sig_genes_young, "12vs17w", wdir, cell_type)
+}
+```
+
+
+
+```{r GSEA FULL RANKINGS}
+matrix_to_list <- function(pws){
+  pws.1 <- list()
+  for (pw in colnames(pws)){
+    pws.1[[pw]] <- rownames(pws)[as.logical(pws[, pw])]
+  }
+  return(pws.1)
+}
+
+prepare_gmt <- function(gmt_file_path, result_genes){
+  gmt <- gmtPathways(gmt_file_path)
+  hidden <- unique(unlist(gmt))
+  genes <- result_genes$gene
+  gmt_mat <- matrix(NA, dimnames= list(hidden, names(gmt)),
+                    nrow= length(hidden), ncol= length(gmt))
+  for (i in 1:dim(gmt_mat)[2]){
+    gmt_mat[,i] <- as.numeric(hidden %in% gmt[[i]])
+  }
+  
+  hidden1 <- intersect(genes, hidden) # subsets to genes in data
+  gmt_mat <- gmt_mat[hidden1, colnames(gmt_mat)[which(colSums(gmt_mat[hidden1,])>5)]] # keeps pathways with at least 5 genes annotated
+  
+  final_list <- matrix_to_list(gmt_mat)
+  return(final_list)
+}
+
+for (cell_type in cell_types) {
+  res_ashr_old <- res_ashr_old_list[[cell_type]]
+  res_ashr_young <- res_ashr_young_list[[cell_type]]
+  
+  res_old_df <- prepare_res_df(res_ashr_old) %>% 
+    rownames_to_column(var="gene") 
+  
+  res_young_df <- prepare_res_df(res_ashr_young) %>% 
+    rownames_to_column(var="gene") 
+
+  #gmt_file_path = "/mnt/da8aa2c4-0136-465b-87a2-d12a59afec55/akurjan/analysis/rnotebooks/Resources/Human_GOBP_AllPathways_no_GO_iea_October_01_2023_symbol.gmt"
+  #gmt_genes_old <- prepare_gmt(gmt_file_path, res_old_df)
+  #gmt_genes_young <- prepare_gmt(gmt_file_path, res_young_df)
+
+  rankings_old <- sign(res_old_df$log2FoldChange)*(-log10(res_old_df$pvalue))
+  names(rankings_old) <- res_old_df$gene
+  rankings_old <- as.data.frame(rankings_old) %>%
+    rownames_to_column(var="GeneName") 
+  colnames(rankings_old) <- c("GeneName","rank")
+  #rankings_old <- sort(rankings_old, decreasing = TRUE)
+  #plot(rankings_old)
+  #max_ranking_old <- max(rankings_old[is.finite(rankings_old)])
+  #min_ranking_old <- min(rankings_old[is.finite(rankings_old)])
+  #rankings_old <- replace(rankings_old, rankings_old > max_ranking_old, max_ranking_old * 10)
+  #rankings_old <- replace(rankings_old, rankings_old < min_ranking_old, min_ranking_old * 10)
+  rankings_old <- rankings_old[order(as.numeric(rankings_old[,2]),decreasing = TRUE),] # sort genes by ranking
+  
+  write.table(rankings_old, 
+              file.path(wdir, cell_type, "Results","ASHR_WALD_ 20vs17w_GeneRanks.rnk"), 
+            col.name = TRUE, sep="\t", row.names = FALSE, quote = FALSE)
+  
+  rankings_young <- sign(res_young_df$log2FoldChange)*(-log10(res_young_df$padj))
+  names(rankings_young) <- res_young_df$gene
+  rankings_young <- as.data.frame(rankings_young) %>%
+    rownames_to_column(var="GeneName") 
+  colnames(rankings_young) <- c("GeneName","rank")
+  rankings_young <- rankings_young[order(as.numeric(rankings_young[,2]),decreasing = TRUE),] 
+  #rankings_young <- sort(rankings_young, decreasing = TRUE)
+  #plot(rankings_young)
+  #max_ranking_young <- max(rankings_young[is.finite(rankings_young)])
+  #min_ranking_young <- min(rankings_young[is.finite(rankings_young)])
+  #rankings_young <- replace(rankings_young, rankings_young > max_ranking_young, max_ranking_young * 10)
+  #rankings_young <- replace(rankings_young, rankings_young < min_ranking_young, min_ranking_young * 10)
+  #rankings_young <- sort(rankings_young, decreasing = TRUE) # sort genes by ranking
+  
+  write.table(rankings_young, 
+              file.path(wdir, cell_type, "Results","ASHR_WALD_ 12vs17w_GeneRanks.rnk"), 
+            col.name = TRUE, sep="\t", row.names = FALSE, quote = FALSE)
+}
+```
+
+```{r HEATMAPS (UPREG/DOWNREG) OF MATRISOMAL DEGS FROM NORMALISED +/- SCALED COUNTS}
+# Get top N number of genes for each ECM protein category and make into a single dataframe object
+get_top_genes_by_category <- function(data, matrisome, top_n, descending = FALSE) {
+  data <- data %>%
+    mutate(Gene = row.names(data)) %>%
+    filter(Gene %in% matrisome$`Gene Symbol`) %>%
+    mutate(Category = matrisome$Category[match(Gene, matrisome$`Gene Symbol`)])
+  data_split <- split(data, data$Category)
+  top_genes <- data.frame()
+  for (category in names(data_split)) { 
+      category_genes <- data_split[[category]] %>%
+        arrange(ifelse(descending, dplyr::desc(log2FoldChange), log2FoldChange)) %>%
+        head(top_n) 
+      top_genes <- bind_rows(top_genes, category_genes)
+  }
+  return(top_genes)
+}
+
+# Function to create a heatmap for a given top_genes object
+create_heatmap <- function(top_genes, normalised_counts, cell_type, target_replicate, title_suffix) {
+  norm_counts_filtered <- normalised_counts[, grepl(paste0("_", target_replicate, "$"), colnames(normalised_counts))] %>%
+    data.frame(check.names = FALSE) %>%
+    mutate(gene = row.names(normalised_counts)) %>%
+    filter(gene %in% top_genes$Gene)
+  
+  if (nrow(norm_counts_filtered) < 2) { # Check if there are at least 2 genes in the list
+    return(NULL)  # Skip plotting if fewer than 2 genes
+  }
+  
+  # Create row (sample) annotations
+  sample_names <- colnames(norm_counts_filtered[, -ncol(norm_counts_filtered)])
+  anno <- metadata %>%
+    rownames_to_column(var="samplename") %>% 
+    as_tibble() %>%
+    filter(samplename %in% sample_names) %>%
+    select(samplename, type, age) %>% 
+    data.frame(row.names = "samplename")
+  
+  # Create a matrix for heatmap
+  heatmap_data <- t(norm_counts_filtered[, -ncol(norm_counts_filtered)])
+  
+  # Create column (gene) annotations
+  #heatmap_genes <- colnames(heatmap_data)
+  #annocol <- matrisome %>%
+  #  as_tibble() %>%
+  #  filter(`Gene Symbol` %in% heatmap_genes)  
+  #annocol <- annocol %>%
+  #  select(`Gene Symbol`, Category) %>%
+  #  data.frame(row.names = annocol$`Gene Symbol`) 
+  #annocol <- subset(annocol, select = -c(Gene.Symbol))
+  
+  annocol <- top_genes %>%
+    mutate(Category = Category) %>%
+    select(Category)
+    
+  # Create a clustered heatmap using pheatmap
+  name = paste(cell_type, "_heatmap", title_suffix, ".svg")
+  #svg(file.path(wdir, cell_type, "Figures", name))
+  heatmap_obj <- pheatmap(heatmap_data,
+                          cellwidth = 15, cellheight = 12,
+                          color = colorRampPalette(rev(brewer.pal(8, "PuOr")))(25),
+                          main = paste(cell_type,"(", title_suffix, ")"),
+                          cluster_rows = FALSE,
+                          cluster_cols = FALSE,
+                          scale='row',
+                          fontsize = 10, 
+                          fontsize_row = 10,
+                          annotation_col=annocol,
+                          annotation_row=anno,
+                          height = 5,
+                          width=30)
+  #dev.off()
+  #name2 = paste(cell_type, "_heatmap", title_suffix, "_hidden.svg")
+  #svg(file.path(wdir, cell_type, "Figures", name2))
+  #pheatmap(heatmap_data,
+  #        cellwidth = 15, cellheight = 12,
+  #       color = colorRampPalette(rev(brewer.pal(8, "PuOr")))(25), 
+  #        main = paste(cell_type, "(", title_suffix, ")"),
+  #        cluster_rows = TRUE,
+  #        cluster_cols = TRUE,
+  #        show_rownames = TRUE,
+  #        scale='row',
+  #        treeheight_col = 0, treeheight_row = 0,
+  #        fontsize = 10, 
+  #        annotation_row=anno,
+  #        annotation_col=annocol,
+  #        fontsize_row = 10, 
+  #        height = 15,
+  #        width=50)
+  #dev.off()
+  return(heatmap_obj)
+}
+
+for (cell_type in cell_types) {
+  normalised_counts <- normalised_counts_list[[cell_type]]
+  up_young <- upregulated_young_ASHR_list[[cell_type]]
+  up_old <- upregulated_old_ASHR_list[[cell_type]]
+  down_young <- downregulated_young_ASHR_list[[cell_type]]
+  down_old <- downregulated_old_ASHR_list[[cell_type]]
+  
+  # Extract the replicate number from the sample names and choose the target replicate
+  target_replicate <- 0  # Change this to select a different replicate
+  
+  # Get the top upregulated and downregulated genes for both young and old
+  top_up_young <- get_top_genes_by_category(up_young, matrisome, 20, descending = TRUE)
+  top_down_young <- get_top_genes_by_category(down_young, matrisome, 20)
+  top_up_old <- get_top_genes_by_category(up_old, matrisome, 20, descending = TRUE)
+  top_down_old <- get_top_genes_by_category(down_old, matrisome, 20)
+  
+  create_heatmap(top_up_young, normalised_counts, cell_type, target_replicate, "Up in 17w vs 12w")
+  create_heatmap(top_up_old, normalised_counts, cell_type, target_replicate, "Up in 20w vs 17w")
+  create_heatmap(top_down_young, normalised_counts, cell_type, target_replicate, "Down in 17w vs 12w")
+  create_heatmap(top_down_old, normalised_counts, cell_type, target_replicate, "Down in 20w vs 17w")
+  
+  combined_young <-rbind(top_up_young, top_down_young)
+  combined_old <-rbind(top_up_old, top_down_old)
+  hm1 <- create_heatmap(combined_young, normalised_counts,  cell_type, target_replicate, "Combined Young Up/Down")
+  hm2 <- create_heatmap(combined_old, normalised_counts, cell_type, target_replicate, "Combined Old Up/Down")
+  
+  # Remove variables to free up memory
+  #rm(up_old, up_young, down_old, down_young, normalised_counts, 
+  #   top_up_young, top_down_young, top_up_old, top_down_old,
+  #   combined_young, combined_old,
+  #   norm_counts_filt, target_replicate, all_matrisome_genes,
+  #   top_genes, category, category_name, category_genes, 
+  #   i, heatmap_up_old, heatmap_genes, subplot_grid)
+  
+}
+```
+
+```{r HEATMAPS (UPREG/DOWNREG) OF MATRISOMAL DEGS FROM VST TRANSFORMED COUNTS}
+# Function to create a heatmap for a given top_genes object
+create_heatmap_vst <- function(top_genes, vst_mat, cell_type, target_replicate, title_suffix) {
+  vst_mat_filtered <- vst_mat[, grepl(paste0("_", target_replicate, "$"), colnames(vst_mat))] %>%
+    data.frame(check.names = FALSE) %>%
+    mutate(gene = row.names(vst_mat)) %>%
+    filter(gene %in% top_genes$Gene)
+  
+  if (nrow(vst_mat_filtered) < 2) { # Check if there are at least 2 genes in the list
+    return(NULL)  # Skip plotting if fewer than 2 genes
+  }
+  
+  # Create row (sample) annotations
+  sample_names <- colnames(vst_mat_filtered[, -ncol(vst_mat_filtered)])
+  anno <- metadata %>%
+    rownames_to_column(var="samplename") %>% 
+    as_tibble() %>%
+    filter(samplename %in% sample_names) %>%
+    select(samplename, type, age) %>% 
+    data.frame(row.names = "samplename")
+  
+  # Create a matrix for heatmap
+  heatmap_data <- t(vst_mat_filtered[, -ncol(vst_mat_filtered)])
+  
+  # Create column (gene) annotations
+  #heatmap_genes <- colnames(heatmap_data)
+  #annocol <- matrisome %>%
+  #  as_tibble() %>%
+  #  filter(`Gene Symbol` %in% heatmap_genes)  
+  #annocol <- annocol %>%
+  #  select(`Gene Symbol`, Category) %>%
+  #  data.frame(row.names = annocol$`Gene Symbol`) 
+  #annocol <- subset(annocol, select = -c(Gene.Symbol))
+  
+  annocol <- top_genes %>%
+    mutate(Category = Category) %>%
+    select(Category)
+    
+  # Create a clustered heatmap using pheatmap
+  name = paste(cell_type, "_heatmap_vst", title_suffix, ".svg")
+  #svg(file.path(wdir, cell_type, "Figures", name))
+  heatmap_obj <- pheatmap(heatmap_data,
+                          cellwidth = 15, cellheight = 12,
+                          color = colorRampPalette(rev(brewer.pal(8, "PuOr")))(25),
+                          main = paste(cell_type,"(", title_suffix, ")"),
+                          cluster_rows = FALSE,
+                          cluster_cols = TRUE,
+                          #scale='row',
+                          fontsize = 10, 
+                          fontsize_row = 10,
+                          annotation_col=annocol,
+                          annotation_row=anno,
+                          height = 5,
+                          width=30)
+  #dev.off()
+}
+
+for (cell_type in cell_types) {
+  dds <- dds_list[[cell_type]]
+  vst <- vst(dds, blind = TRUE)
+  vst_mat <- assay(vst)
+  
+  up_young <- upregulated_young_ASHR_list[[cell_type]]
+  up_old <- upregulated_old_ASHR_list[[cell_type]]
+  down_young <- downregulated_young_ASHR_list[[cell_type]]
+  down_old <- downregulated_old_ASHR_list[[cell_type]]
+  
+  # Extract the replicate number from the sample names and choose the target replicate
+  target_replicate <- 0  # Change this to select a different replicate
+  
+  # Get the top upregulated and downregulated genes for both young and old
+  top_up_young <- get_top_genes_by_category(up_young, matrisome, 20, descending = TRUE)
+  top_down_young <- get_top_genes_by_category(down_young, matrisome, 20)
+  top_up_old <- get_top_genes_by_category(up_old, matrisome, 20, descending = TRUE)
+  top_down_old <- get_top_genes_by_category(down_old, matrisome, 20)
+  
+  create_heatmap_vst(top_up_young, vst_mat, cell_type, target_replicate, "Up in 17w vs 12w")
+  create_heatmap_vst(top_up_old, vst_mat, cell_type, target_replicate, "Up in 20w vs 17w")
+  create_heatmap_vst(top_down_young, vst_mat, cell_type, target_replicate, "Down in 17w vs 12w")
+  create_heatmap_vst(top_down_old, vst_mat, cell_type, target_replicate, "Down in 20w vs 17w")
+}
+
+
+```
+
+```{r HEATMAPS (ALL SIGNIFICANT) OF MATRISOMAL DEGS FROM VST TRANSFORMED COUNTS}
+# Get top N number of genes for each ECM protein category and make into a single dataframe object
+get_top_genes_fromall_by_category <- function(data, matrisome, top_n) {
+  data <- data %>%
+    mutate(Gene = row.names(data)) %>%
+    filter(Gene %in% matrisome$`Gene Symbol`) %>%
+    mutate(Category = matrisome$Category[match(Gene, matrisome$`Gene Symbol`)])
+  data_split <- split(data, data$Category)
+  top_genes <- data.frame()
+  for (category in names(data_split)) { 
+      category_genes <- data_split[[category]] %>%
+        arrange(dplyr::desc(abs(log2FoldChange))) %>%
+        head(top_n)
+      top_genes <- bind_rows(top_genes, category_genes)
+  }
+  return(top_genes)
+}
+
+# Function to create a heatmap for a given top_genes object
+create_heatmap_vst <- function(top_genes, vst_mat, cell_type, target_replicate, title_suffix) {
+  vst_mat_filtered <- vst_mat[, grepl(paste0("_", target_replicate, "$"), colnames(vst_mat))] %>%
+    data.frame(check.names = FALSE) %>%
+    mutate(gene = row.names(vst_mat)) %>%
+    filter(gene %in% top_genes$Gene)
+  
+  if (nrow(vst_mat_filtered) < 2) { # Check if there are at least 2 genes in the list
+    return(NULL)  # Skip plotting if fewer than 2 genes
+  }
+  
+  # Create row (sample) annotations
+  sample_names <- colnames(vst_mat_filtered[, -ncol(vst_mat_filtered)])
+  anno <- metadata %>%
+    rownames_to_column(var="samplename") %>% 
+    as_tibble() %>%
+    filter(samplename %in% sample_names) %>%
+    select(samplename, type, age) %>% 
+    data.frame(row.names = "samplename")
+  
+  # Create a matrix for heatmap
+  heatmap_data <- t(vst_mat_filtered[, -ncol(vst_mat_filtered)])
+  
+  # Create column (gene) annotations
+  #heatmap_genes <- colnames(heatmap_data)
+  #annocol <- matrisome %>%
+  #  as_tibble() %>%
+  #  filter(`Gene Symbol` %in% heatmap_genes)  
+  #annocol <- annocol %>%
+  #  select(`Gene Symbol`, Category) %>%
+  #  data.frame(row.names = annocol$`Gene Symbol`) 
+  #annocol <- subset(annocol, select = -c(Gene.Symbol))
+  
+  annocol <- top_genes %>%
+    mutate(Category = Category) %>%
+    select(Category)
+    
+  # Create a clustered heatmap using pheatmap
+  name = paste(cell_type, "_heatmap_vst", title_suffix, ".svg")
+  svg(file.path(wdir, cell_type, "Figures", name))
+  heatmap_obj <- pheatmap(heatmap_data,
+                          cellwidth = 15, cellheight = 12,
+                          color = colorRampPalette(rev(brewer.pal(8, "RdBu")))(7),
+                          main = paste(cell_type,"(", title_suffix, ")"),
+                          cluster_rows = FALSE,
+                          cluster_cols = TRUE,
+                          scale='row',
+                          fontsize = 10, 
+                          fontsize_row = 10,
+                          annotation_col=annocol,
+                          annotation_row=anno,
+                          height = 10,
+                          width=135)
+  dev.off()
+  return(heatmap_obj)
+}
+
+get_sig_genes <- function(res_mat){
+  sig_genes <- res_mat %>% 
+    dplyr::filter(padj < 0.01 & abs(log2FoldChange) >= 0.58) %>%
+    dplyr::arrange(dplyr::desc(abs(log2FoldChange)))
+  return(sig_genes)
+}
+
+# Extract the replicate number from the sample names and choose the target replicate
+target_replicate <- 0  # Change this to select a different replicate
+
+for (cell_type in cell_types) {
+  dds <- dds_list[[cell_type]]
+  vst <- vst(dds, blind = TRUE)
+  vst_mat <- assay(vst)
+  
+  res_ashr_young <- res_ashr_young_list[[cell_type]]
+  res_ashr_old <- res_ashr_old_list[[cell_type]]
+  
+  res_ashr_old_df_mat <- prepare_res_mat(res_ashr_old, matrisome)
+  res_ashr_young_df_mat <- prepare_res_mat(res_ashr_young, matrisome)
+  
+  sig_genes_old <- get_sig_genes(res_ashr_old_df_mat)
+  sig_genes_young <- get_sig_genes(res_ashr_young_df_mat)
+  
+  topECM_old <- get_top_genes_fromall_by_category(sig_genes_old, matrisome, 10)
+  topECM_young <- get_top_genes_fromall_by_category(sig_genes_young, matrisome, 10)
+  
+  heatmap_vst_young <- create_heatmap_vst(topECM_young, vst_mat, cell_type, target_replicate, "Up in 17w vs 12w")
+  heatmap_vst_old <- create_heatmap_vst(topECM_old, vst_mat, cell_type, target_replicate, "Up in 20w vs 17w")
+}
+
+```
+
+
+```{r}
+rm(volcano_data, volcano_plot, volcano1, volcano2, category, category_colors, cell_type,
+   colors, genes_in_category, heatmap_down_young, heatmap_file1, heatmap_file2, heatmap_down_old,
+   heatmap_up_young, pca_type, pca_scree, pca_age, pca_libbatch, target_replicate, 
+   variables_to_remove, num_pcs, li, up_young, up_old, top_down_old, top_young, top_down_young, 
+   top_old, top_up_old, top_up_young, res_young, res_old, res_ashr_old_df_mat, res_ashr_young_df_mat,
+   res_ashr_old, res_ashr_young, norm_counts_filtered, annocol, combined_old, combined_young,
+   dds, dds_lrt, down_old, down_young, filtered_matrisome, gene_groups, hm, hm1, hm2, normalised_counts)
+rm(metadata_file, upregulated_file, downregulated_file, counts_file, all_genes_file, input_folder,
+   vst, vst_mat, topECM_down_young, top_genes, topECM_old, topECM_up_young, topECM_young, sig_genes_old,
+   sig_genes_young, res_ashr_old_df, res_ashr_young_df, heatmap_vst_old, heatmap_vst_young, data, category_genes)
+```
+
+
+
+
+```{r}
+
+for (cell_type in cell_types) {
+  res_lrt <- res_lrt_list[[cell_type]]
+  res_lrt_tb <- res_lrt %>%
+    data.frame() %>%
+    rownames_to_column(var="gene") %>% 
+    as_tibble()
+  normalized_counts <- normalized_counts_lrt_list[[cell_type]]
+  cluster_groups <- cluster_groups_list[[cell_type]]
+  group1 <- cluster_groups %>%
+            dplyr::filter(cluster == 1)
+  group2 <- cluster_groups %>%
+            dplyr::filter(cluster == 2)
+  meta2 <- metadata %>% 
+    rownames_to_column(var="samplename") %>% 
+    as_tibble()
+  
+  matrisome <- matrisome[1:683,]
+  coremat <- matrisome %>%
+                    dplyr::filter(matrisome$Division == 'Core matrisome') #Matrisome-associated or Core matrisome
+  upregulated_ECM <- group1 %>%
+                    dplyr::filter(group1$genes %in%
+                                    coremat$`Gene Symbol`
+                                  )
+  downregulated_ECM <- group2 %>%
+                    dplyr::filter(group2$genes %in%
+                                    coremat$`Gene Symbol`
+                                    )
+
+  up_ECMsig <- res_lrt_tb %>%
+              dplyr::filter(res_lrt_tb$gene %in% upregulated_ECM$genes) %>%
+                data.frame(check.names = FALSE)
+  
+  down_ECMsig <- res_lrt_tb %>%
+              dplyr::filter(res_lrt_tb$gene %in% downregulated_ECM$genes) %>%
+              data.frame(check.names = FALSE)
+
+  matrisome_LRTsig_genes_up <- up_ECMsig %>% arrange(padj) %>% pull(gene)
+  matrisome_LRTsig_genes_down <- down_ECMsig %>% arrange(padj) %>% pull(gene)
+  
+  norm_matrisome_df_up <- normalized_counts %>% 
+    mutate(gene = row.names(normalized_counts)) %>%
+    dplyr::filter(gene %in% matrisome_LRTsig_genes_up)
+  
+  norm_matrisome_df_down <- normalized_counts %>% 
+    mutate(gene = row.names(normalized_counts)) %>%
+    dplyr::filter(gene %in% matrisome_LRTsig_genes_down)
+
+
+  # Gathering the columns to have normalized counts to a single column
+  gathered_norm_matrisome_up <- norm_matrisome_df_up %>%
+    gather(key = "samplename", value = "normalized_counts", -gene)
+  
+  gathered_norm_matrisome_down <- norm_matrisome_df_down %>%
+    gather(key = "samplename", value = "normalized_counts", -gene)
+  
+  gathered_norm_matrisome_up <- inner_join(meta2, gathered_norm_matrisome_up)
+  gathered_norm_matrisome_down <- inner_join(meta2, gathered_norm_matrisome_down)
+
+  upplot <- ggplot(gathered_norm_matrisome_up) +
+        geom_point(aes(x = gene, y = normalized_counts, color = age), size = 3) +
+        scale_y_log10() +
+        scale_color_manual(values = NDORMS_pallette) +
+        xlab("Genes") +
+        ylab("log10 Normalized Counts") +
+        ggtitle("DE Core ECM Genes (Upregulated)") +
+        theme_bw() +
+	      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+	      theme(plot.title = element_text(hjust = 0.5))
+  ggsave(file.path(wdir, cell_type, "Figures", "Upregulated_CoreECM_Genes.svg"), plot = upplot, width = 15, height = 9) 
+  
+  downplot <- ggplot(gathered_norm_matrisome_down) +
+          geom_point(aes(x = gene, y = normalized_counts, color = age), size = 3) +
+          scale_y_log10() +
+          scale_color_manual(values = NDORMS_pallette) +
+          xlab("Genes") +
+          ylab("log10 Normalized Counts") +
+          ggtitle("DE Core ECM Genes (Downregulated)") +
+          theme_bw() +
+  	      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  	      theme(plot.title = element_text(hjust = 0.5))
+  ggsave(file.path(wdir, cell_type, "Figures", "Downregulated_CoreECM_Genes.svg"), plot = downplot, width = 15, height = 9) 
+}
+```
+
+
+
+
+
+
+
+
+
+
+------------------------------------------------------------------------
+## LRT Time course analysis of DEGs: Clustering - Identifying changes over time
+```{r}
+# List of cell type names
+cell_types <- c("ABI3BP_GAS2_Fibroblasts_1", #, 
+                #"ABI3BP_GAS2_Fibroblasts_2"#, 
+                #"NEGR1_SCN7A_Fibroblasts"???
+                "COL3A1_PI16_Fibroblasts",
+                "COL6A6_FNDC1_Fibroblasts")
+                #"FGF14_THBS4_Fibroblasts" ???
+                #"Satellite_Cells",
+                #"Skeletal_Myocytes",
+                #"Smooth_Myocytes",
+                #"vasEndothelial_Cells"
+                #"lymEndothelial_Cells",
+                #"Nervous_System_Cells",
+                #"Immune_Cells"
+#)
+
+```
+
+```{r}
+# Get top N number of genes for each ECM protein category and make into a single dataframe object
+get_top_genes_fromall_by_category <- function(data, matrisome, top_n) {
+  data <- data %>%
+    mutate(Gene = row.names(data)) %>%
+    filter(Gene %in% matrisome$`Gene Symbol`) %>%
+    mutate(Category = matrisome$Category[match(Gene, matrisome$`Gene Symbol`)])
+  data_split <- split(data, data$Category)
+  top_genes <- data.frame()
+  for (category in names(data_split)) { 
+      category_genes <- data_split[[category]] %>%
+        arrange(dplyr::desc(abs(log2FoldChange))) %>%
+        head(top_n)
+      top_genes <- bind_rows(top_genes, category_genes)
+  }
+  return(top_genes)
+}
+
+# Function to create a heatmap for a given top_genes object
+create_heatmap_vst <- function(top_genes, vst_mat, cell_type, target_replicate, title_suffix) {
+  vst_mat_filtered <- vst_mat[, grepl(paste0("_", target_replicate, "$"), colnames(vst_mat))] %>%
+    data.frame(check.names = FALSE) %>%
+    mutate(gene = row.names(vst_mat)) %>%
+    filter(gene %in% top_genes$Gene)
+  
+  if (nrow(vst_mat_filtered) < 2) { # Check if there are at least 2 genes in the list
+    return(NULL)  # Skip plotting if fewer than 2 genes
+  }
+  
+  # Create row (sample) annotations
+  sample_names <- colnames(vst_mat_filtered[, -ncol(vst_mat_filtered)])
+  anno <- metadata %>%
+    rownames_to_column(var="samplename") %>% 
+    as_tibble() %>%
+    filter(samplename %in% sample_names) %>%
+    select(samplename, type, age) %>% 
+    data.frame(row.names = "samplename")
+  
+  # Create a matrix for heatmap
+  heatmap_data <- t(vst_mat_filtered[, -ncol(vst_mat_filtered)])
+  
+  annocol <- top_genes %>%
+    mutate(Category = Category) %>%
+    select(Category)
+    
+  # Create a clustered heatmap using pheatmap
+  name = paste(cell_type, "_heatmap_vst", title_suffix, ".svg")
+  svg(file.path(wdir, cell_type, "Figures", name))
+  heatmap_obj <- pheatmap(heatmap_data,
+                          cellwidth = 15, cellheight = 12,
+                          color = colorRampPalette(rev(brewer.pal(8, "RdBu")))(7),
+                          main = paste(cell_type,"(", title_suffix, ")"),
+                          cluster_rows = FALSE,
+                          cluster_cols = TRUE,
+                          scale='row',
+                          fontsize = 10, 
+                          fontsize_row = 10,
+                          annotation_col=annocol,
+                          annotation_row=anno,
+                          height = 10,
+                          width=135)
+  dev.off()
+  return(heatmap_obj)
+}
+
+get_sig_genes <- function(res_mat){
+  sig_genes <- res_mat %>% 
+    dplyr::filter(padj < 0.01 & abs(log2FoldChange) >= 0.58) %>%
+    dplyr::arrange(dplyr::desc(abs(log2FoldChange)))
+  return(sig_genes)
+}
+
+# Extract the replicate number from the sample names and choose the target replicate
+target_replicate <- 0  # Change this to select a different replicate
+sigLRT_genes_list <- list()
+cluster_groups_list <- list()
+
+for (cell_type in cell_types) {
+  dds_lrt <- dds_lrt_list[[cell_type]]
+  vst <- vst(dds_lrt, blind = TRUE)
+  vst_mat <- assay(vst)
+  
+  res_lrt <- res_lrt_list[[cell_type]]
+  
+  res_lrt_df_mat <- prepare_res_mat(res_lrt, matrisome)
+  res_allgenes_df <- prepare_res_df(res_lrt)
+  
+  sig_genes_mat <- get_sig_genes(res_lrt_df_mat)
+  sig_genes_allgenes <- get_sig_genes_topN(res_allgenes_df, 50)
+  
+  topECM <- get_top_genes_fromall_by_category(sig_genes_mat, matrisome, 10)
+  
+  heatmap_vst_young <- create_heatmap_vst(topECM, vst_mat, cell_type, target_replicate, "LRT Top ECM Significant")
+  heatmap_vst_old <- create_heatmap_vst_all(sig_genes_allgenes, vst_mat, cell_type, target_replicate, "LRT Top 50 Significant")
+}
+
+```
+
+
+```{r}
+# List of cell type names
+cell_types <- c(#"ABI3BP_GAS2_Fibroblasts_1",
+                #"ABI3BP_GAS2_Fibroblasts_2",
+                #"NEGR1_SCN7A_Fibroblasts",
+                "COL3A1_PI16_Fibroblasts",
+                "COL6A6_FNDC1_Fibroblasts",
+                "FGF14_THBS4_Fibroblasts"
+                #"Satellite_Cells",
+                #"Skeletal_Myocytes",
+                #"Smooth_Myocytes",
+                #"vasEndothelial_Cells",
+                #"lymEndothelial_Cells",
+                #"Nervous_System_Cells",
+                #"Immune_Cells"
+)
+```
+
+
+```{r LRT CLUSTERING - TAKES A LONG TIME TO RUN!}
+gprofiler2_functionalprof <- function(cluster_groups, wdir, cell_type){
+  # Create a pdf to fill
+  pdf(file = file.path(wdir, cell_type, "Results", "gprofiler2_functionalprof.pdf"), width=10, height=10, onefile = TRUE) 
+  # Iterate over clusters
+  set.seed(500)
+  for (i in levels(cluster_groups$cluster)){
+            group <- cluster_groups %>%
+            filter(cluster == i)
+      # Run functional profiling
+      gost.res <- gost(group$genes, organism = "hsapiens", correction_method = "fdr", significant = TRUE, exclude_iea = TRUE)
+      # Create plots
+      gostplot <- gostplot(gost.res, interactive = FALSE, capped = T) + ggtitle(paste0("Cluster ", i, "; calculated with ", nrow(group), " genes"))
+      subset <- gost.res$result
+      subset <- subset[subset$source == "GO:BF"|  subset$source == "KEGG" | subset$source == "REAC", ]
+      subset <- subset[order(subset$p_value),]
+      publish_gostplot(gostplot, highlight_terms = c(head(subset$term_id, 15)), width = NA, height = NA)
+  }
+  dev.off()
+}
+
+gprofiler2_functionalTF <- function(cluster_groups, wdir, cell_type){
+  # Create a pdf to fill
+  pdf(file = file.path(wdir, cell_type, "Results", "gprofiler2_functionalTFs.pdf"), width=10, height=10, onefile = TRUE) 
+  # Iterate over clusters
+  set.seed(500)
+  for (i in levels(cluster_groups$cluster)){
+            group <- cluster_groups %>%
+            filter(cluster == i)
+      # Run functional profiling
+      gost.res <- gost(group$genes, organism = "hsapiens", correction_method = "fdr", significant = TRUE, exclude_iea = TRUE)
+      # Create plots
+      gostplot <- gostplot(gost.res, interactive = FALSE, capped = T) + ggtitle(paste0("Cluster ", i, "; calculated with ", nrow(group), " genes"))
+      subset <- gost.res$result
+      subset <- subset[subset$source == "TF"|  subset$source == "HPA", ]
+      subset <- subset[order(subset$p_value),]
+      publish_gostplot(gostplot, highlight_terms = c(head(subset$term_id, 15)), width = NA, height = NA)
+  }
+  dev.off()
+}
+
+ego_functionalprof <- function(cluster_groups, res_lrt_df, wdir, cell_type){
+  for (i in levels(cluster_groups$cluster)){
+    group <- cluster_groups %>% filter(cluster == i)
+    allgenes <- res_lrt_df$gene
+    ego <- enrichGO(gene = group$gene,
+                      universe = allgenes,
+                      keyType = "SYMBOL",
+                      OrgDb = org.Hs.eg.db, 
+                      ont = "BP", 
+                      pAdjustMethod = "BH", 
+                      qvalueCutoff = 0.05, 
+                      readable = TRUE)
+      #ego <- enrichGO(gene = group$genes,
+      #                universe = res_lrt_df$gene,
+      #                keyType = "SYMBOL",
+      #                OrgDb = org.Hs.eg.db, 
+      #                ont = "BP", 
+      #                pAdjustMethod = "BH", 
+      #                qvalueCutoff = 0.05, 
+      #                readable = TRUE)
+      ## Output results from GO analysis to a table 
+    cluster_summary <- ego@result
+    write.csv(cluster_summary, file = file.path(wdir, cell_type, "Results", paste0("LRT_clusterProfiler_BF_Cluster", i, "_001pval.csv")))
+    }
+}
+
+gprofiler2_save_gem_lrt <- function(cluster_groups, wdir, cell_type){
+      for (i in levels(cluster_groups$cluster)){
+        group <- cluster_groups %>% filter(cluster == i)
+        exclude_index <- !grepl("^ENSG", group$genes) # excluding ENSG without symbols
+        filtered_genes <- group$genes[exclude_index]
+        gostres <- gost(filtered_genes, organism = "hsapiens", user_threshold = 0.05, 
+                             correction_method = "fdr", significant = TRUE, 
+                             exclude_iea = TRUE, ordered_query = TRUE)
+        gem <- gostres$result[,c("term_id", "term_name", "p_value", "intersection_size")]
+        colnames(gem) <- c("GO.ID", "Description", "p.Val", "Genes")
+        gem$FDR <- gem$p.Val
+        gem$Phenotype = "+1"
+        gem <- gem[,c("GO.ID", "Description", "p.Val", "FDR", "Phenotype", "Genes")]
+        write.table(gem, file = file.path(wdir, cell_type, "Results", paste0("LRT_gProfiler2_GEM_Cluster", i, ".txt")), sep = "\t", quote = F, row.names = F)
+    }
+}
+
+gprofiler2_save_rankings_lrt <- function(cluster_groups, res_lrt_df, wdir, cell_type){
+      for (i in levels(cluster_groups$cluster)){
+        group <- cluster_groups %>% filter(cluster == i)
+        subset_reslrt <- res_lrt_df[res_lrt_df$gene %in% group$genes, ] # Subset results to keep only cluster genes 
+        rankings <- sign(subset_reslrt$log2FoldChange)*(-log10(subset_reslrt$pvalue))
+        names(rankings) <- subset_reslrt$gene
+        rankings <- as.data.frame(rankings) %>%
+          rownames_to_column(var="GeneName") 
+        colnames(rankings) <- c("GeneName","rank")
+        rankings <- rankings[order(as.numeric(rankings[,2]),decreasing = TRUE),] # sort genes by ranking
+        write.table(rankings, file.path(wdir, cell_type, "Results", paste0("LRT_GeneRanks_Cluster", i, ".rnk")), 
+            col.name = TRUE, sep="\t", row.names = FALSE, quote = FALSE)
+        }
+}
+
+sigLRT_genes_list <- list()
+cluster_groups_list <- list()
+normalized_counts_lrt_list <- list()
+
+for (cell_type in cell_types) {
+  dds_lrt <- dds_lrt_list[[cell_type]]
+  vst <- vst(dds_lrt, blind = TRUE)
+  vst_mat <- assay(vst)
+  
+  res_lrt <- res_lrt_list[[cell_type]]
+  res_lrt_df <- prepare_res_df(res_lrt) %>% 
+    rownames_to_column(var="gene") 
+
+  sigLRT_genes <- res_lrt_df %>% 
+    dplyr::filter(padj < 0.01) %>%
+    arrange(padj)
+  sigLRT_genes_list[[cell_type]] <- sigLRT_genes
+  
+  # Check if there are any significant genes
+  if (nrow(sigLRT_genes) > 0) {
+    # Check if the gene names exist in vst_mat
+    valid_genes <- sigLRT_genes$gene[sigLRT_genes$gene %in% rownames(vst_mat)]
+    
+    if (length(valid_genes) > 0) {
+      cluster_vst <- vst_mat[valid_genes, ]
+      # Continue with further processing using cluster_vst
+    } else {
+      cat("No valid genes found in vst_mat.\n")
+    }
+  } else {
+    cat("No significant genes found.\n")
+  }
+
+  #cluster_vst <- vst_mat[sigLRT_genes$gene, ]
+  
+  # Subset metadatalrt using the common values
+  common_values <- intersect(row.names(metadatalrt), colnames(cluster_vst))
+  subset_metadatalrt <- metadatalrt[common_values, ]
+
+  clusters <- degPatterns(cluster_vst, metadata = subset_metadatalrt, time = "age", plot = TRUE, minc = 15, reduce = TRUE)
+  #ggsave(file.path(wdir, cell_type, "Figures", "LRT_clusterplot_1.svg"), clusters, width = 10, height = 10)
+
+  clusters2 <- degPlotCluster(clusters$normalized, 'age', lines=false)
+  ggsave(file.path(wdir, cell_type, "Figures", "LRT_clusterplot_2.tiff"), clusters2, width = 7, height = 7)
+  normclusterdata <- clusters2$data
+
+  cluster_groups <- clusters$df
+  cluster_groups$cluster <- as.factor(cluster_groups$cluster)
+  cluster_groups_list[[cell_type]] <- cluster_groups$genes
+  
+  
+  for (i in levels(cluster_groups$cluster)){
+    group <- cluster_groups %>% filter(cluster == i)
+    write.csv(group, file = file.path(wdir, cell_type, "Results", paste0("Genes_Cluster", i, ".csv")))
+  }
+            
+  save(clusters, file = file.path(wdir, cell_type, "Results", "LRT_Clusters_Data.RData"))
+  save(clusters2, file = file.path(wdir, cell_type, "Results", "LRT_Clusters_GGPlot.RData"))
+  write.csv(normclusterdata, file = file.path(wdir, cell_type, "Results", "LRT_Full_Cluster_Data.csv"))
+  
+  gprofiler2_functionalprof(cluster_groups, wdir, cell_type)
+  gprofiler2_functionalTF(cluster_groups, wdir, cell_type)
+  ego_functionalprof(cluster_groups, res_lrt_df, wdir, cell_type)
+  gprofiler2_save_rankings_lrt(cluster_groups, res_lrt_df, wdir, cell_type)
+  gprofiler2_save_gem_lrt(cluster_groups, wdir, cell_type)
+}
+```
+
+
+```{r COMPARING COMMON GO:BP PATHWAYS}
+#library(readr)
+#library(VennDiagram)
+library(ggVennDiagram)
+library(ggvenn)
+#library(gtools)
+
+# List of cell type names
+cell_types <- c("ABI3BP_GAS2_Fibroblasts_1",
+                "ABI3BP_GAS2_Fibroblasts_2",
+                #"NEGR1_SCN7A_Fibroblasts",
+                "COL3A1_PI16_Fibroblasts",
+                "COL6A6_FNDC1_Fibroblasts",
+                "FGF14_THBS4_Fibroblasts"
+                #"Satellite_Cells",
+                #"Skeletal_Myocytes",
+                #"Smooth_Myocytes",
+                #"vasEndothelial_Cells",
+                #"lymEndothelial_Cells",
+                #"Nervous_System_Cells",
+                #"Immune_Cells"
+)
+
+# Step 1: Initialize empty lists for each category of pathways
+upregulated_paths <- list()
+downregulated_paths <- list()
+updownreg_paths <- list()
+downupreg_paths <- list()
+
+# load GO:BP pathway csv files for each CT for each type of cluster
+for (cell_type in cell_types) {
+  # Initialize empty lists for each category of pathways for the current cell type
+  up_paths <- list()
+  down_paths <- list()
+  updown_paths <- list()
+  downup_paths <- list()
+  
+  # Loop through file suffixes
+  suffixes <- c("_UP.csv", "_DOWN.csv", "_UPDOWN.csv", "_UPMIDDLE.csv")
+  
+  for (suffix in suffixes) {
+    # Construct the file name
+    filename_pattern <- paste0("gProfiler_hsapiens_.*", suffix, "$")
+    # List all files in the current cell_type directory that match the pattern
+    matching_files <- list.files(file.path(wdir, cell_type, "Results"), pattern = filename_pattern)
+    
+    # Check if the file exists
+    for (file_name in matching_files) {
+      # Read the CSV file into a dataframe
+      df <- read.csv(file.path(wdir, cell_type, "Results", file_name))
+      
+      # Extract the second column with GO:BP pathways and add them to the corresponding list
+      if (grepl("_UP.csv$", file_name)) {
+        up_paths[[length(up_paths) + 1]] <- df[, 2]
+      } else if (grepl("_DOWN.csv$", file_name)) {
+        down_paths[[length(down_paths) + 1]] <- df[, 2]
+      } else if (grepl("_UPDOWN.csv$", file_name)) {
+        updown_paths[[length(updown_paths) + 1]] <- df[, 2]
+      } else if (grepl("_UPMIDDLE.csv$", file_name)) {
+        downup_paths[[length(downup_paths) + 1]] <- df[, 2]
+      }
+    }
+  }
+  # Combine the lists for the current cell type and store them in the corresponding global list
+  upregulated_paths[[cell_type]] <- unlist(up_paths)
+  downregulated_paths[[cell_type]] <- unlist(down_paths)
+  updownreg_paths[[cell_type]] <- unlist(updown_paths)
+  downupreg_paths[[cell_type]] <- unlist(downup_paths)  
+}
+
+# Define categories and corresponding pathway lists
+categories <- c("upregulated", "downregulated", "updownreg", "upmiddlereg")
+pathway_lists <- list(
+  upregulated = upregulated_paths,
+  downregulated = downregulated_paths,
+  updownreg = updownreg_paths,
+  upmiddlereg = downupreg_paths
+)
+
+# Initialize empty lists to store the results
+unique_pathways_by_cell_type <- list()
+unique_pathways_list <- list()
+shared_pathways <- list()
+#second_largest_pathways <- list()  
+  
+for (category in categories) {
+  # Extract cell type names dynamically from pathway_lists
+  cell_type_names <- names(pathway_lists[[category]])
+  # Extract pathways for each cell type and category
+  pathway_sets <- lapply(cell_type_names, function(ct_name) {
+    pathway_lists[[category]][[ct_name]]
+  })
+  # Create a vector of colors with "black" for each cell type
+  num_cell_types <- length(pathway_sets)
+  set_colors <- rep("black", num_cell_types)
+  
+  venn <- ggVennDiagram(x=pathway_sets, 
+                category.names=cell_type_names,
+                label="count",
+                label_geom="label",
+                label_alpha = 0,
+                label_size=3,
+                edge_size = 0.2,
+                set_color = set_colors)+
+    scale_x_continuous(expand = expansion(mult = .5)) + 
+    scale_fill_gradient(low="white", high="#E77D73") +
+    scale_color_manual(values = set_colors)
+  #ggsave(filename = file.path(wdir, paste0(category, "_venn.pdf")), venn)
+  #ggsave(filename = file.path(wdir, paste0(category, "_venn.svg")), venn)
+  
+  # Extract pathways for the current category
+  category_pathways <- pathway_lists[[category]]
+  
+  # Extract pathways SHARE among ALL cell types
+  shared_pathways[[category]] <- Reduce(intersect, category_pathways)
+  
+  # Loop through cell types
+  for (cell_type in cell_type_names) {
+    # Extract pathways for the current cell type
+    current_pathways <- category_pathways[[cell_type]]
+    
+    # Initialize a vector to store the unique pathways for the current cell type
+    unique_pathways <- current_pathways
+    
+    # Loop through the other cell types and find unique pathways
+    for (other_cell_type in cell_type_names) {
+      if (other_cell_type != cell_type) {
+        other_pathways <- category_pathways[[other_cell_type]]
+        unique_pathways <- setdiff(unique_pathways, other_pathways)
+      }
+    }
+  
+  # Store the unique pathways for the current cell type in the same hierarchy
+  unique_pathways_by_cell_type[[cell_type]] <- list(unique_pathways = unique_pathways)
+
+  # Store the unique pathways under the category name
+  unique_pathways_list[[category]] <- unique_pathways_by_cell_type
+  }
+}
+
+rm(pathway_sets, venn, updown_paths, unique.partitions,
+   up_paths, unique_pathways_for_category, unique_pathways_for_cell_type, second_largest_pathways,
+   downup_paths, down_paths, df, category_pathways, data_split,
+   unique_pathways_by_cell_type)
+```
+
+# Radar Plots
+```{r}
+# Create an empty data frame to store all counts
+all_counts <- data.frame()
+
+# Iterate over cell types
+for (cell_type in cell_types) {
+  counts_file <- paste0(input_folder, "counts_matrix_", cell_type, ".csv")
+  counts <- read.csv(counts_file, row.names = 1)
+  
+  # Add a column to specify the cell type for each sample
+  counts$cell_type <- cell_type
+  
+  # Append the counts to the all_counts data frame
+  all_counts <- rbind(all_counts, counts)
+}
+
+# Remove the cell type column from the counts data frame
+all_counts$cell_type <- NULL
+
+# Now, you have a single counts data frame with all counts
+# Create a DESeqDataSet using this counts data frame
+dds_combined_lrt <- DESeqDataSetFromMatrix(countData = all_counts,
+                              colData = metadatalrt,  # Use the metadata from one cell type
+                              design = ~ age)
+
+# Filtering: keep samples that have a count of higher than 30
+dds_combined_lrt <- dds_combined_lrt[rowSums(counts(dds_combined_lrt)) > 30, ]
+
+```
+
+
+```{r}
+dds_combined_lrt
+
+# Create DESeqDataSet for a given cell type
+for (cell_type in cell_types) {
+  metadata_file <- paste0(input_folder, "metadata_", cell_type, ".csv")
+  counts_file <- paste0(input_folder, "counts_matrix_", cell_type, ".csv")
+  
+  metadata <- read.csv(metadata_file, row.names = 1)
+  metadata$libbatch <- as.factor(metadata$libbatch)
+  metadata$replicate <- as.factor(metadata$replicate)
+  
+  metadatalrt <- metadata
+  metadatalrt$age <- factor(metadata$age, levels = c("12w", "17w", "20w"))
+  metadata$age <- factor(metadata$age, levels = c("17w", "12w", "20w"))
+  
+  counts <- read.csv(counts_file, row.names = 1)
+  
+  print(cell_type)
+  dds <- DESeqDataSetFromMatrix(countData = counts,
+                                colData = metadata,
+                                design = ~ age)
+  
+  dds_lrt <- DESeqDataSetFromMatrix(countData = counts,
+                                colData = metadatalrt,
+                                design = ~ age)
+  
+  # Filtering: keep samples that have a count of higher than 30
+  dds <- dds[rowSums(counts(dds)) > 30, ]
+  dds_lrt <- dds_lrt[rowSums(counts(dds_lrt)) > 30, ]
+  
+  dds_list[[cell_type]] <- dds
+  dds_lrt_list[[cell_type]] <- dds_lrt
+}
+
+rm(dds, dds_lrt, counts)
+```
+
+
+```{r PREPARING LRT NORMALISED COUNTS BY CT AND AGE}
+normalised_counts_lrt_list_byage <- normalised_counts_lrt_list
+gene_names_ct_list <- list()
+
+# Loop through cell types in the original list
+for (cell_type in names(normalised_counts_lrt_list)) {
+  cell_type_data <- normalised_counts_lrt_list[[cell_type]]
+  gene_names <- rownames(normalised_counts_lrt_list_byage[[cell_type]])
+  gene_names_ct_list[[cell_type]] <- gene_names
+  
+  # Create a new list for the current cell type
+  normalised_counts_lrt_list_byage[[cell_type]] <- list()
+  
+  # Loop through the samples in the current cell type
+  for (sample in names(cell_type_data)) {
+    # Extract the age from the sample name
+    age <- as.character(sub(".*_([0-9]+w)_.*", "\\1", sample))
+    
+    # Add the sample data to the respective age in the new structure
+    if (!(age %in% names(normalised_counts_lrt_list_byage[[cell_type]]))) {
+      normalised_counts_lrt_list_byage[[cell_type]][[age]] <- list()
+    }
+    normalised_counts_lrt_list_byage[[cell_type]][[age]][[sample]] <- cell_type_data[[sample]]
+  }
+}
+
+for (cell_type in cell_types) {
+  for (age in names(normalised_counts_lrt_list_byage[[cell_type]])) {
+    # Convert the age to a character
+    age_character <- as.character(age)
+    
+    # Create a dataframe for counts at the current age
+    age_counts_df <- as.data.frame(normalised_counts_lrt_list_byage[[cell_type]][[age_character]])
+    rownames(age_counts_df) <- gene_names_ct_list[[cell_type]]
+    
+    # Update the list with the dataframe for the current age
+    normalised_counts_lrt_list_byage[[cell_type]][[age_character]] <- age_counts_df
+  }
+}
+```
+
+```{r PREPARING PATHWAY GENES}
+fetch_pathway_genes <- function(go_term, target_gene_symbol_db) {
+  result <- gconvert(query = go_term, organism = "hsapiens", target = target_gene_symbol_db, mthreshold = Inf, filter_na = TRUE)
+  return(result$target)
+}
+
+goIdToTerm <- function(x, names = TRUE, keepNA = TRUE) {
+    stopifnot(requireNamespace("GO.db"))
+    stopifnot(requireNamespace("AnnotationDbi"))
+    ans <- rep(NA_character_, length(x))
+    names(ans) <- x
+    ids <- AnnotationDbi::GOID(GO.db::GOTERM)
+    i <- match(x, ids)
+    k <- which(!is.na(i))
+    res <- AnnotationDbi::Term(GO.db::GOTERM[i[k]])
+    ans[k] <- res
+    if (!keepNA) ans[is.na(ans)] <- names(ans[is.na(ans)])
+    if (!names) names(ans) <- NULL
+    return(ans)
+}
+
+create_pathway_genes_list <- function(go_terms) {
+  pathway_genes_list <- list()
+  
+  for (go_term in go_terms) {
+    gene_list <- fetch_pathway_genes(go_term, "HGNC")
+    pathway_name <- goIdToTerm(go_term, names=FALSE)
+    pathway_genes_list[[pathway_name]] <- gene_list
+  }
+  
+  return(pathway_genes_list)
+}
+
+#go_terms <- c(
+#    "GO:0030198",  # ECM_organization
+#    "GO:0048251",  # Elastic_fiber_assembly
+#    "GO:0071711",  # Basement_membrane_org
+#    "GO:0022617",  # ECM_disassembly
+#    "GO:0085029",  # ECM_assembly
+#    "GO:0030199",  # Collagen_fibril_org
+#    "GO:0070278"   # ECM_secretion
+ # )
+
+go_terms <- c('GO:0071711','GO:1901202', 'GO:1901203', 'GO:0070278','GO:1903054', 'GO:1903055', 'GO:0032966', 'GO:0032967')
+pathway_genes_list <- create_pathway_genes_list(go_terms)
+```
+
+```{r SCORING PATHWAY GENES - NO SUBSETTING BY AGE}
+pathway_genes_by_ct <- list()
+
+# Iterate through pathways in pathway_genes_list
+for (pathway_name in names(pathway_genes_list)) {
+  # Create a sub-list for the current pathway
+  pathway_genes_by_ct[[pathway_name]] <- list()
+  
+  for (cell_type in cell_types) {
+    # Filter pathway genes to retain only those present in the dataset
+    pathway_genes <- pathway_genes_list[[pathway_name]]
+    pathway_genes <- pathway_genes[pathway_genes %in% rownames(normalised_counts_lrt_list[[cell_type]])]
+    
+    # Score those genes for a given cell type
+    pathway_genes_by_ct[[pathway_name]][[cell_type]] <- pathway_genes
+  }
+}
+
+# Create a list to store pathway scores by cell type
+pathway_scores_by_ct <- list()
+
+
+# Iterate through pathways
+for (pathway_name in names(pathway_genes_by_ct)) {
+  # Create a sub-list for the current pathway
+  pathway_scores_by_ct[[pathway_name]] <- list()
+  
+  # Iterate through cell types
+  for (cell_type in cell_types) {
+    # Get the pathway genes for the current cell type
+    pathway_genes <- pathway_genes_by_ct[[pathway_name]][[cell_type]]
+    
+    # Calculate gene scores for the pathway using the mean expression
+    gene_scores <- rowMeans(normalised_counts_lrt_list[[cell_type]][pathway_genes, , drop = FALSE])
+    
+    # Aggregate the gene scores to get the pathway score for the cell type
+    pathway_score <- mean(gene_scores)
+    
+    # Store the pathway score for the current cell type
+    pathway_scores_by_ct[[pathway_name]][[cell_type]] <- pathway_score
+  }
+}
+
+# Create an empty data frame with cell types as rows and pathway names as columns
+pathway_scores_df <- data.frame(Cell_Type = cell_types)
+for (pathway_name in names(pathway_scores_by_ct)) {
+  pathway_scores_df[pathway_name] <- sapply(cell_types, function(ct) {
+    # Retrieve the pathway score for the current cell type and pathway
+    score <- pathway_scores_by_ct[[pathway_name]][[ct]]
+    return(score)
+  })
+}
+# Set row names to NULL (optional)
+rownames(pathway_scores_df) <- NULL
+
+# Print the resulting data frame
+print(pathway_scores_df)
+```
+
+```{r SCORING PATHWAY GENES - SUBSETTING BY AGE}
+pathway_genes_by_ct <- list()
+
+# Iterate through pathways in pathway_genes_list
+for (pathway_name in names(pathway_genes_list)) {
+  # Create a sub-list for the current pathway
+  pathway_genes_by_ct[[pathway_name]] <- list()
+  
+  for (cell_type in cell_types) {
+    # Filter pathway genes to retain only those present in the dataset
+    pathway_genes <- pathway_genes_list[[pathway_name]]
+    pathway_genes <- pathway_genes[pathway_genes %in% rownames(normalised_counts_lrt_list[[cell_type]])]
+    
+    # Score those genes for a given cell type
+    pathway_genes_by_ct[[pathway_name]][[cell_type]] <- pathway_genes
+  }
+}
+
+# Initialize a list to store pathway scores
+pathway_scores_by_age <- list()
+unique_age_values <- names(normalised_counts_lrt_list_byage[[cell_type]])
+
+# Iterate through pathways
+for (pathway_name in names(pathway_genes_by_ct)) {
+  # Create a sub-list for the current pathway
+  pathway_scores_by_age[[pathway_name]] <- list()
+  
+  # Iterate through cell types
+  for (cell_type in cell_types) {
+    # Create a sub-list for the current cell type
+    pathway_scores_by_age[[pathway_name]][[cell_type]] <- list()
+    
+    # Iterate through ages
+    for (age in unique_age_values) {
+      # Get the pathway genes for the current cell type
+      pathway_genes <- pathway_genes_by_ct[[pathway_name]][[cell_type]]
+      
+      # Calculate gene scores for the pathway using the mean expression
+      gene_scores <- rowMeans(normalised_counts_lrt_list_byage[[cell_type]][[age]][pathway_genes, , drop = FALSE])
+      
+      # Aggregate the gene scores to get the pathway score for the cell type and age
+      pathway_score <- mean(gene_scores) 
+      
+      # Store the pathway score for the current cell type and age
+      pathway_scores_by_age[[pathway_name]][[cell_type]][[age]] <- pathway_score
+    }
+  }
+}
+
+# Create a vector of unique combinations of Cell_Type and Age
+cell_type_age_combinations <- expand.grid(Cell_Type = cell_types, Age = unique_age_values)
+
+# Create an empty data frame with the correct row names
+pathway_scores_df <- data.frame(Cell_Type_Age = paste(cell_type_age_combinations$Cell_Type, cell_type_age_combinations$Age, sep = "_"))
+
+# Remove the "Cell_Type_Age" column and set the row names
+row.names(pathway_scores_df) <- pathway_scores_df$Cell_Type_Age
+
+
+# Fill the data frame with pathway scores
+for (pathway_name in names(pathway_scores_by_age)) {
+  for (cell_type in cell_types) {
+    for (age in unique_age_values) {
+      # Retrieve the pathway score for the current cell type and age
+      score <- pathway_scores_by_age[[pathway_name]][[cell_type]][[age]]
+      pathway_scores_df[paste(cell_type, age, sep = "_"), pathway_name] <- score
+    }
+  }
+}
+
+# Print the resulting data frame
+print(pathway_scores_df)
+```
+
+```{r MIN-MAX SCALING}
+scaled_pathway_scores_df <- pathway_scores_df
+
+# Min-max scaling function
+min_max_scale <- function(x) {
+  return(100 * (x - min(x)) / (max(x) - min(x)))
+}
+
+# Apply min-max scaling to all columns (pathway scores) in the dataframe
+scaled_pathway_scores_df[,-1] <- lapply(scaled_pathway_scores_df[,-1], min_max_scale)
+
+scaled_pathway_scores_df <- rbind(
+  c("Max", sapply(scaled_pathway_scores_df[,-1], max)),
+  c("Min", sapply(scaled_pathway_scores_df[,-1], min)),
+  scaled_pathway_scores_df
+)
+
+# Set the "cell_type" column as row names
+row.names(scaled_pathway_scores_df) <- scaled_pathway_scores_df$Cell_Type_Age
+
+# Remove the "cell_type" column from the DataFrame
+scaled_pathway_scores_df <- scaled_pathway_scores_df[, -1]
+
+# Convert all columns in the DataFrame to numeric
+scaled_pathway_scores_df[, -1] <- sapply(scaled_pathway_scores_df[, -1], as.numeric)
+scaled_pathway_scores_df[,1] <- as.numeric(scaled_pathway_scores_df[,1])
+
+# Check the data types to verify that all columns are numeric
+glimpse(scaled_pathway_scores_df)
+
+#write.csv(scaled_pathway_scores_df, file = file.path(wdir, "scaled_pathway_scores_basic.csv"), row.names = TRUE)
+#scaled_pathway_scores_df
+# Print the resulting scaled dataframe
+print(scaled_pathway_scores_df)
+```
+
+
+
+```{r PLOTTING RADAR CHARTS}
+library(fmsb)
+library(scales)
+library(RColorBrewer)
+
+data_for_radar <- scaled_pathway_scores_df
+rownames_data <- unique(rownames(data_for_radar))
+
+for (cell_type in cell_types){
+  
+  subset_data <- data_for_radar[c("Max", "Min"), ]
+  groups <- data_for_radar[grep(paste0("^", cell_type, "_"), rownames(data_for_radar)), ]
+  subset_data <- rbind(subset_data, groups)
+  labels <- str_extract(rownames(groups), "(?<=_)[^_]+$")
+  
+  # Color vector
+  #colors_border=c( rgb(0.2,0.5,0.5,0.9), rgb(0.8,0.2,0.5,0.9) , rgb(0.7,0.5,0.1,0.9) )
+  #colors_in=c( rgb(0.2,0.5,0.5,0.4), rgb(0.8,0.2,0.5,0.4) , rgb(0.7,0.5,0.1,0.4) )
+  #coul <- brewer.pal(3, "BuPu")
+  colors_border <- c("#B43E44", "#496496", "#FADF92")
+  colors_in <- alpha(colors_border,0.2)
+  
+  pdf(file.path(wdir, paste0(cell_type, "_radar_chart2.pdf")), width = 10, height = 6)
+  # Create a radar chart using the subset_data
+  par(mar = c(1, 2, 2, 2))
+  radar <- radarchart(subset_data, 
+             axistype = 1, 
+             centerzero=TRUE,
+             #Polygon:
+             pcol = colors_border,      # Color for each line
+             pfcol = colors_in, #scales::alpha(areas, 0.3),
+             plwd = 4,        # Width for each line
+             plty = "solid",        # Line type for each line 
+             #Grid:
+             cglty = 1,       # Grid line type
+             cglwd= 0.8,
+             cglcol = "gray", # Grid line color
+             caxislabels = seq(0, 100, 20),
+             calcex = 0.9,
+             seg = 5,
+             #Axis:
+             paxis = pathway_names,
+             axislabcol = "black", 
+             #Variable Labels:
+             #vlabels = 
+             vlcex = 0.9, #font size of variable labels
+             pty = 16,
+             title = paste0("Pathway Scores For ", cell_type)
+             )
+  legend("topright",
+       legend = labels,
+       bty = "n", pch = 20, col = colors_border,
+       text.col = "grey25", pt.cex = 2)
+  dev.off()
+  #ggsave(filename = file.path(wdir, paste0(cell_type, "_radar_chart.pdf")), radar)
+}
+```
+
+
+```{r}
+# load GO:BP pathway csv files for each CT for each type of cluster
+for (cell_type in cell_types) {
+  # Initialize empty lists for each category of pathways for the current cell type
+  up_paths <- list()
+  down_paths <- list()
+  updown_paths <- list()
+  downup_paths <- list()
+  
+  # Loop through file suffixes
+  suffixes <- c("_UP.csv", "_DOWN.csv", "_UPDOWN.csv", "_UPMIDDLE.csv")
+  
+  for (suffix in suffixes) {
+    # Construct the file name
+    filename_pattern <- paste0("gProfiler_hsapiens_.*", suffix, "$")
+    # List all files in the current cell_type directory that match the pattern
+    matching_files <- list.files(file.path(wdir, cell_type, "Results"), pattern = filename_pattern)
+    
+    # Check if the file exists
+    for (file_name in matching_files) {
+      # Read the CSV file into a dataframe
+      df <- read.csv(file.path(wdir, cell_type, "Results", file_name))
+      
+      # Extract the second column with GO:BP pathways and add them to the corresponding list
+      if (grepl("_UP.csv$", file_name)) {
+        up_paths[[length(up_paths) + 1]] <- df
+      } else if (grepl("_DOWN.csv$", file_name)) {
+        down_paths[[length(down_paths) + 1]] <- df
+      } else if (grepl("_UPDOWN.csv$", file_name)) {
+        updown_paths[[length(updown_paths) + 1]] <- df
+      } else if (grepl("_UPMIDDLE.csv$", file_name)) {
+        downup_paths[[length(downup_paths) + 1]] <- df
+      }
+    }
+  }
+}
+```
+
+
+
+```{r}
+# Get top N number of genes for each ECM protein category and make into a single dataframe object
+get_top_genes_by_category <- function(data, matrisome, top_n, descending = FALSE) {
+  data <- data %>%
+    mutate(Gene = row.names(data)) %>%
+    filter(Gene %in% matrisome$`Gene Symbol`) %>%
+    mutate(Category = matrisome$Category[match(Gene, matrisome$`Gene Symbol`)])
+  data_split <- split(data, data$Category)
+  top_genes <- data.frame()
+  for (category in names(data_split)) { 
+      category_genes <- data_split[[category]] %>%
+        arrange(ifelse(descending, dplyr::desc(log2FoldChange), log2FoldChange)) %>%
+        head(top_n) 
+      top_genes <- bind_rows(top_genes, category_genes)
+  }
+  return(top_genes)
+}
+
+
+# Function to create a heatmap for a given top_genes object
+create_heatmap <- function(top_genes, normalised_counts, cell_type, target_replicate, title_suffix) {
+  norm_counts_filtered <- normalised_counts[, grepl(paste0("_", target_replicate, "$"), colnames(normalised_counts))] %>%
+    data.frame(check.names = FALSE) %>%
+    mutate(gene = row.names(normalised_counts)) %>%
+    filter(gene %in% top_genes$Gene)
+  if (nrow(norm_counts_filtered) < 2) { # Check if there are at least 2 genes in the list
+    return(NULL)  # Skip plotting if fewer than 2 genes
+  }
+  
+  # Create row (sample) annotations
+  sample_names <- colnames(norm_counts_filtered[, -ncol(norm_counts_filtered)])
+  anno <- metadata %>%
+    rownames_to_column(var="samplename") %>% 
+    as_tibble() %>%
+    filter(samplename %in% sample_names) %>%
+    select(samplename, type, age) %>% 
+    data.frame(row.names = "samplename")
+  
+  # Create a matrix for heatmap
+  heatmap_data <- t(norm_counts_filtered[, -ncol(norm_counts_filtered)])
+  
+  # Create column (gene) annotations
+  #heatmap_genes <- colnames(heatmap_data)
+  #annocol <- matrisome %>%
+  #  as_tibble() %>%
+  #  filter(`Gene Symbol` %in% heatmap_genes)  
+  #annocol <- annocol %>%
+  #  select(`Gene Symbol`, Category) %>%
+  #  data.frame(row.names = annocol$`Gene Symbol`) 
+  #annocol <- subset(annocol, select = -c(Gene.Symbol))
+  
+  annocol <- top_genes %>%
+    mutate(Category = Category) %>%
+    select(Category)
+    
+  # Create a clustered heatmap using pheatmap
+  name = paste(cell_type, "_heatmap", title_suffix, ".svg")
+  #svg(file.path(wdir, cell_type, "Figures", name))
+  heatmap_obj <- pheatmap(heatmap_data,
+                          cellwidth = 15, cellheight = 12,
+                          color = colorRampPalette(rev(brewer.pal(8, "PuOr")))(25),
+                          main = paste(cell_type,"(", title_suffix, ")"),
+                          cluster_rows = FALSE,
+                          cluster_cols = FALSE,
+                          scale='row',
+                          fontsize = 10, 
+                          fontsize_row = 10,
+                          annotation_col=annocol,
+                          annotation_row=anno,
+                          height = 5,
+                          width=30)
+  #dev.off()
+  #name2 = paste(cell_type, "_heatmap", title_suffix, "_hidden.svg")
+  #svg(file.path(wdir, cell_type, "Figures", name2))
+  #pheatmap(heatmap_data,
+  #        cellwidth = 15, cellheight = 12,
+  #       color = colorRampPalette(rev(brewer.pal(8, "PuOr")))(25), 
+  #        main = paste(cell_type, "(", title_suffix, ")"),
+  #        cluster_rows = TRUE,
+  #        cluster_cols = TRUE,
+  #        show_rownames = TRUE,
+  #        scale='row',
+  #        treeheight_col = 0, treeheight_row = 0,
+  #        fontsize = 10, 
+  #        annotation_row=anno,
+  #        annotation_col=annocol,
+  #        fontsize_row = 10, 
+  #        height = 15,
+  #        width=50)
+  #dev.off()
+  return(heatmap_obj)
+}
+
+for (cell_type in cell_types) {
+  normalised_counts <- normalised_counts_list[[cell_type]]
+  up_young <- upregulated_young_ASHR_list[[cell_type]]
+  up_old <- upregulated_old_ASHR_list[[cell_type]]
+  down_young <- downregulated_young_ASHR_list[[cell_type]]
+  down_old <- downregulated_old_ASHR_list[[cell_type]]
+  
+  # Extract the replicate number from the sample names and choose the target replicate
+  target_replicate <- 0  # Change this to select a different replicate
+  
+  # Get the top upregulated and downregulated genes for both young and old
+  top_up_young <- get_top_genes_by_category(up_young, matrisome, 20, descending = TRUE)
+  top_down_young <- get_top_genes_by_category(down_young, matrisome, 20)
+  top_up_old <- get_top_genes_by_category(up_old, matrisome, 20, descending = TRUE)
+  top_down_old <- get_top_genes_by_category(down_old, matrisome, 20)
+  
+  create_heatmap(top_up_young, normalised_counts, cell_type, target_replicate, "Up in 17w vs 12w")
+  create_heatmap(top_up_old, normalised_counts, cell_type, target_replicate, "Up in 20w vs 17w")
+  create_heatmap(top_down_young, normalised_counts, cell_type, target_replicate, "Down in 17w vs 12w")
+  create_heatmap(top_down_old, normalised_counts, cell_type, target_replicate, "Down in 20w vs 17w")
+  
+  combined_young <-rbind(top_up_young, top_down_young)
+  combined_old <-rbind(top_up_old, top_down_old)
+  hm1 <- create_heatmap(combined_young, normalised_counts,  cell_type, target_replicate, "Combined Young Up/Down")
+  hm2 <- create_heatmap(combined_old, normalised_counts, cell_type, target_replicate, "Combined Old Up/Down")
+  
+  # Remove variables to free up memory
+  #rm(up_old, up_young, down_old, down_young, normalised_counts, 
+  #   top_up_young, top_down_young, top_up_old, top_down_old,
+  #   combined_young, combined_old,
+  #   norm_counts_filt, target_replicate, all_matrisome_genes,
+  #   top_genes, category, category_name, category_genes, 
+  #   i, heatmap_up_old, heatmap_genes, subplot_grid)
+  
+}
+```
+
+
+```{r}
+rm(normalized_counts, group1, group2, group3, group4, cluster_groups, clusters, 
+     clusters2, meta, cluster_rlog, clustering_sig_genes, dds, rld, rld_mat, 
+     sigLRT_genes, res_lrt, res_lrt_tb, ensembl_ids, top20_plot, 
+     gathered_top20_norm, top20_norm, top20_res, anno, cluster_summary_list, cluster_summary, group, meta2, ego, dds_lrt)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
